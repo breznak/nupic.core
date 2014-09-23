@@ -499,7 +499,20 @@ void SpatialPooler::getConnectedCounts(UInt connectedCounts[]) const
   copy(connectedCounts_.begin(), connectedCounts_.end(), connectedCounts);
 }
 
+Real SpatialPooler::getSynPermMin()
+{
+  return synPermMin_;
+}
 
+Real SpatialPooler::getSynPermMax()
+{
+  return synPermMax_;
+}
+
+Int SpatialPooler::getSeed()
+{
+  return rngSeed_;
+}
 
 void SpatialPooler::initialize(vector<UInt> inputDimensions,
   vector<UInt> columnDimensions,
@@ -544,7 +557,7 @@ void SpatialPooler::initialize(vector<UInt> inputDimensions,
             (localAreaDensity > 0 && localAreaDensity <= 0.5));
   NTA_ASSERT(potentialPct > 0 && potentialPct <= 1);
 
-  seed_( (UInt64)(seed < 0 ? rand() : seed) );
+  seed_(seed);
 
   potentialRadius_ = potentialRadius > numInputs_ ? numInputs_ :
                                                     potentialRadius;
@@ -571,6 +584,7 @@ void SpatialPooler::initialize(vector<UInt> inputDimensions,
   initConnectedPct_ = 0.5;
   iterationNum_ = 0;
   iterationLearnNum_ = 0;
+  rngSeed_ = seed;
 
   tieBreaker_.resize(numColumns_);
   for (UInt i = 0; i < numColumns_; i++) {
@@ -1343,7 +1357,7 @@ bool SpatialPooler::isUpdateRound_()
 /* create a RNG with given seed */
 void SpatialPooler::seed_(UInt64 seed)
 {
-  rng_ = Random(seed);
+  rng_ = Random(seed != -1 ? rand() : seed);
 }
 
 UInt SpatialPooler::persistentSize() const

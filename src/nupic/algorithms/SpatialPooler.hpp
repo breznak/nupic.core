@@ -814,7 +814,11 @@ namespace nupic {
            */
           void printParameters() const;
 
+          Real getSynPermMin();
 
+          Real getSynPermMax();
+
+          Int getSeed();
           ///////////////////////////////////////////////////////////
           //
           // Implementation methods. all methods below this line are
@@ -1431,6 +1435,7 @@ namespace nupic {
 
           UInt version_;
           Random rng_;
+          Int rngSeed_;
 
       };
     } // end namespace spatial_pooler
