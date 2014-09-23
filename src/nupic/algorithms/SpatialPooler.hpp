@@ -1369,7 +1369,7 @@ namespace nupic {
 
           @param seed 64bit int of random seed
           */
-          void seed_(UInt64 seed);
+          void seed_(Int64 seed);
 
           //-------------------------------------------------------------------
           // Debugging helpers

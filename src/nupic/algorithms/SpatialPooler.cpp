@@ -1355,9 +1355,9 @@ bool SpatialPooler::isUpdateRound_()
 }
 
 /* create a RNG with given seed */
-void SpatialPooler::seed_(UInt64 seed)
+void SpatialPooler::seed_(Int64 seed)
 {
-  rng_ = Random(seed != -1 ? rand() : seed);
+  rng_ = Random(seed == -1 ? rand() : seed);
 }
 
 UInt SpatialPooler::persistentSize() const
