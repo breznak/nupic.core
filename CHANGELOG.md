@@ -1,5 +1,125 @@
 # Changelog
 
+## 1.1.0
+
+* Comunity release
+*  4a9c8a2..0c4a30a
+* added CI for Win, OSX, Linux
+* testing binary releases
+
+## 1.0.6
+
+* This release was because of a deployment problem with 1.0.5 and issues with pypi.
+
+## 1.0.5
+
+* 58754cf7 NUP-2519: Upgrade pycapnp to 0.6.3
+* 64fb803e DEVOPS-383: Move deploy to S3 job to circleci workflow
+* 16dbf534 DEVOPS-383: Migrate CircleCI builds from 1.0 to 2.0
+* ec14f2f5 pip install --use-wheel" was deprecated. See https://pip.pypa.io/en/stable/news/#deprecations-and-removals
+* c2d31a95 ignore YCM configuration
+* f7b86e0f "pip install --use-wheel" was deprecated. See https://pip.pypa.io/en/stable/news/#deprecations-and-removals
+* 42df6caa NUP-2504: fix clang link optimization issue on private template function
+* f5bc76b6 NUP-2504: Add unit test to softmax overflow
+* 203493ed NUP-2506: Add missing state fields to serialization
+* 5f1ddcbb NUP-2514: fix traversal limit
+* 7e33ca44 NUP-2506: Add missing operator '==' to classes used in tests
+* e5e48c8e fix accumulate
+* b3513853 add softmax function
+* 0032fbf5 Fix softmax overflow
+
+
+## 1.0.4
+
+* 860459cf NUP-2506: Add operator '==' to classes used in tests
+* ac43320f NUP-2505: Remove win32 build from CI
+* 6a580c06 Fix not include ClassifierResult.hpp error
+* de567a4e NUP-2495: Update clang-format instructions
+* 2f027a7b NUP-2475: Add sparse link validation
+* 3071b8a5 DEVOPS-353: Update "setSparseOutput" documentation
+* 7ae0d64f NUP-2495: Check style using clang-format
+* 8a1d5eeb NUP-2475: Make sure Network API links use the same dtype at both ends
+* 4e800a64 DEVOPS-353: Fix tests to run with nupic.core directly instead of nupic
+* 9ae6155d DEVOPS-353: Implement sparse links
+* de88baaa DEVOPS-353: Add 'isSparse' attribute to input/output
+* 1e486fde DEVOPS-353: Allow element count to be smaller than buffer size
+* c9377d52 Fix cmake version and project name
+* f069c310 Add missing include required for NTA_ASSERT
+* a6c186ae reformat code using clang-format
+* 70d43da1 NUP-2492: Add constructor vs initialize test regarding Issue #1386
+* dabd7f87 NUP-2491: Validate global inhibition parameters
+
+## 1.0.3
+
+* https://github.com/numenta/nupic.core/issues/1380 Added stronger type checking for SP compute input.
+
+## 1.0.2
+
+* NUP-2481: Update capnp to 0.6.1
+* NUP-2469: Mark version as pre-release
+* Don't run iwyu if doing gcc build
+* RES-571 Explicitly declare cmake 3.3 minimum requirement
+
+## 1.0.1
+
+* NUP-2481: Update capnp to 0.6.1
+* Don't run iwyu if doing gcc build
+* RES-571 Explicitly declare cmake 3.3 minimum requirement
+
+## 1.0.0
+
+* Convert getProtoType to getSchema to be consistent with Python interface in nupic
+* Add Circle badge to README
+* Make --user optional since manylinux doens't use it
+* Remove build tools setup for Linux CI jobs since new base image already provides these tools
+* NUP-2341: Expose capnp serialization to SVM swig interface
+* NUP-2341: Add missing 'getSchema'
+* update boost to 1.64.0 stable release
+* Add a "checkInputs" param to the TemporalMemory
+
+## 0.7.2
+
+* Add SWIG support for Cells4 capnp serialization
+
+## 0.7.1
+
+* SP optimization using minmax_element (#1326)
+* Add capnp serialization to Cells4, Cell, Segment, SegmentUpdates, CState, etc. (#1346)
+* Fix missing actValue in SDR classifier SWIG interface (#1348)
+
+## 0.7.0
+
+* Give clear exception when clients attempt to reuse ClassifierResult instance with SDRClassifier (PR #1342)
+* Remove FastClaClassifier (PR #1341)
+* Allow SDR classifier to handle multiple category (PR #1339)
+* Add Cap'n Proto serialization to SVM (PR #1338)
+
+## 0.6.3
+
+* Change the Connections to stop doing automatic segment / synapse cleanup
+* Revamp the TemporalMemory proto so that it captures all information
+* For numpy, use a single PyArray_API symbol per binary rather than one per cpp file
+* Use numpy 1.12.1
+* Use pycapnp 0.5.12
+* Use latest pytest 3.0.7, pytest-cov 2.5.0, pytest-xdist 1.16.0
+
+## 0.6.2
+
+* Updated Circle CI configuration and switch to that for OS X builds (instead of Travis CI)
+* Documentation updates: PyRegion
+* IWYU documentation update
+* Fixed C++ boolean ref counting bug that caused segfaults when running Python projects
+* Update pytest and pycapnp dependency versions
+* Implemented byte buffer passing as alternative Python<->C++ strategy for capnp serialization logic. This has some memory/speed overhead but avoids ABI issues that could cause crashes
+* Fixed prototest to get meaningful comparison numbers
+
+## 0.6.1
+
+* Eliminate installation of unnecessary header files when building nupic.bindings. Install Version.hpp unconditionally for the sake of the deployment usage in .travis.yaml
+* Fixed servicing of delayed links such that the circular buffers of all links within a network are refreshed at the end of each time step; and 0-delay links copy data directly from src to dest, bypassing the circular buffer altogether.
+* Add a nNonZerosPerRowOnCols SparseMatrix method
+* Fix up some out of date SWIG interface code
+
 ## 0.6.0
 
 * NUP-2366 Remove no-longer-relevent test code

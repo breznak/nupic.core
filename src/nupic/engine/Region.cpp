@@ -29,569 +29,617 @@ Methods related to inputs and outputs are in Region_io.cpp
 */
 
 #include <iostream>
-#include <stdexcept>
 #include <set>
+#include <stdexcept>
 #include <string>
+
+#include <nupic/engine/Link.hpp>
 #include <nupic/engine/Region.hpp>
 #include <nupic/engine/RegionImpl.hpp>
 #include <nupic/engine/RegionImplFactory.hpp>
 #include <nupic/engine/Spec.hpp>
 #include <nupic/utils/Log.hpp>
-#include <nupic/engine/Input.hpp>
-#include <nupic/engine/Output.hpp>
-#include <nupic/engine/Link.hpp>
-#include <nupic/ntypes/NodeSet.hpp>
-#include <nupic/os/Timer.hpp>
-#include <nupic/proto/RegionProto.capnp.h>
+#include <nupic/ntypes/BundleIO.hpp>
+#include <nupic/ntypes/Array.hpp>
+#include <nupic/types/BasicType.hpp>
 
-namespace nupic
-{
 
-  class GenericRegisteredRegionImpl;
+namespace nupic {
 
-  // Create region from parameter spec
-  Region::Region(std::string name,
-                 const std::string& nodeType,
-                 const std::string& nodeParams,
-                 Network * network) :
-    name_(std::move(name)),
-    type_(nodeType),
-    initialized_(false),
-    enabledNodes_(nullptr),
-    network_(network),
-    profilingEnabled_(false)
-  {
-    // Set region info before creating the RegionImpl so that the
-    // Impl has access to the region info in its constructor.
-    RegionImplFactory & factory = RegionImplFactory::getInstance();
-    spec_ = factory.getSpec(nodeType);
+class GenericRegisteredRegionImpl;
 
-    // Dimensions start off as unspecified, but if
-    // the RegionImpl only supports a single node, we
-    // can immediately set the dimensions.
-    if (spec_->singleNodeOnly)
-      dims_.push_back(1);
-    // else dims_ = []
+// Create region from parameter spec
+Region::Region(std::string name, const std::string &nodeType,
+               const std::string &nodeParams, Network *network)
+    : name_(std::move(name)), type_(nodeType), initialized_(false),
+      network_(network), profilingEnabled_(false) {
+  // Set region info before creating the RegionImpl so that the
+  // Impl has access to the region info in its constructor.
+  RegionImplFactory &factory = RegionImplFactory::getInstance();
+  spec_ = factory.getSpec(nodeType);
+  impl_.reset(factory.createRegionImpl(nodeType, nodeParams, this));
+}
 
-    impl_ = factory.createRegionImpl(nodeType, nodeParams, this);
-    createInputsAndOutputs_();
+Region::Region(Network *net) {
+      network_ = net;
+      initialized_ = false;
+      profilingEnabled_ = false;
+    } // for deserialization of region.
 
+
+Network *Region::getNetwork() { return network_; }
+
+void Region::createInputsAndOutputs_() {
+  // This is called when a Region is added.
+  // Create all the outputs for this region from the Spec. 
+  // By default outputs are zero size, no dimensions.
+  for (size_t i = 0; i < spec_->outputs.getCount(); ++i) {
+    const std::pair<std::string, OutputSpec> &p = spec_->outputs.getByIndex(i);
+    const std::string& outputName = p.first;
+    const OutputSpec &os = p.second;
+    auto output = new Output(this, outputName, os.dataType);
+    outputs_[outputName] = output;
   }
 
-  // Deserialize region
-  Region::Region(std::string name,
-                 const std::string& nodeType,
-                 const Dimensions& dimensions,
-                 BundleIO& bundle,
-                 Network * network) :
-    name_(std::move(name)),
-    type_(nodeType),
-    initialized_(false),
-    enabledNodes_(nullptr),
-    network_(network),
-    profilingEnabled_(false)
-  {
-    // Set region info before creating the RegionImpl so that the
-    // Impl has access to the region info in its constructor.
-    RegionImplFactory & factory = RegionImplFactory::getInstance();
-    spec_ = factory.getSpec(nodeType);
+  // Create all the inputs for this node type.
+  for (size_t i = 0; i < spec_->inputs.getCount(); ++i) {
+    const std::pair<std::string, InputSpec> &p = spec_->inputs.getByIndex(i);
+    const std::string& inputName = p.first;
+    const InputSpec &is = p.second;
 
-    // Dimensions start off as unspecified, but if
-    // the RegionImpl only supports a single node, we
-    // can immediately set the dimensions.
-    if (spec_->singleNodeOnly)
-      if (!dimensions.isDontcare() && !dimensions.isUnspecified() &&
-          !dimensions.isOnes())
-        NTA_THROW << "Attempt to deserialize region of type " << nodeType
-                  << " with dimensions " << dimensions
-                  << " but region supports exactly one node.";
-
-    dims_ = dimensions;
-
-    impl_ = factory.deserializeRegionImpl(nodeType, bundle, this);
-    createInputsAndOutputs_();
+    Input* input = new Input(this, inputName, is.dataType);
+    inputs_[inputName] = input;
   }
+}
 
-  Region::Region(std::string name, RegionProto::Reader& proto,
-                 Network* network) :
-    name_(std::move(name)),
-    type_(proto.getNodeType().cStr()),
-    initialized_(false),
-    enabledNodes_(nullptr),
-    network_(network),
-    profilingEnabled_(false)
-  {
-    read(proto);
-    createInputsAndOutputs_();
-  }
-
-  Network * Region::getNetwork()
-  {
-    return network_;
-  }
-
-  void Region::createInputsAndOutputs_()
-  {
-
-    // Create all the outputs for this node type. By default outputs are zero size
-    for (size_t i = 0; i < spec_->outputs.getCount(); ++i)
-    {
-      const std::pair<std::string, OutputSpec> & p = spec_->outputs.getByIndex(i);
-      std::string outputName = p.first;
-      const OutputSpec & os = p.second;
-      auto output = new Output(*this, os.dataType, os.regionLevel);
-      outputs_[outputName] = output;
-      // keep track of name in the output also -- see note in Region.hpp
-      output->setName(outputName);
+bool Region::hasOutgoingLinks() const {
+  for (const auto &elem : outputs_) {
+    if (elem.second->hasOutgoingLinks()) {
+      return true;
     }
+  }
+  return false;
+}
 
-    // Create all the inputs for this node type.
-    for (size_t i = 0; i < spec_->inputs.getCount(); ++i)
-    {
-      const std::pair<std::string, InputSpec> & p = spec_->inputs.getByIndex(i);
-      std::string inputName = p.first;
-      const InputSpec &is = p.second;
+Region::~Region() {
+  if (initialized_)
+    uninitialize();
 
-      auto input = new Input(*this, is.dataType, is.regionLevel);
-      inputs_[inputName] = input;
-      // keep track of name in the input also -- see note in Region.hpp
-      input->setName(inputName);
+  // If there are any links connected to our outputs, this should fail.
+  // We catch this error in the Network class and give the
+  // user a good error message (regions may be removed either in
+  // Network::removeRegion or Network::~Network())
+  for (auto &elem : outputs_) {
+    delete elem.second;
+    elem.second = nullptr;
+  }
+  outputs_.clear();
+
+  clearInputs(); // just in case there are some still around.
+
+  // Note: the impl will be deleted when the region goes out of scope.
+}
+
+void Region::clearInputs() {
+  for (auto &input : inputs_) {
+    auto &links = input.second->getLinks();
+    for (auto &link : links) {
+      	link->getSrc().removeLink(link); // remove it from the Output object.
+    }
+	links.clear();
+    delete input.second; // This is an Input object. Its destructor deletes the links.
+    input.second = nullptr;
+  }
+  inputs_.clear();
+}
+
+void Region::initialize() {
+
+  if (initialized_)
+    return;
+
+  // Make sure all unconnected outputs have a buffer.
+  for(auto out: outputs_) {
+    if (!out.second->getData().has_buffer()) {
+      out.second->determineDimensions();
+      out.second->initialize();
     }
   }
 
+  impl_->initialize();
+  initialized_ = true;
+}
 
-  bool Region::hasOutgoingLinks() const
-  {
-    for (const auto & elem : outputs_)
-    {
-      if (elem.second->hasOutgoingLinks())
-      {
-        return true;
-      }
+
+const std::shared_ptr<Spec>& Region::getSpecFromType(const std::string &nodeType) {
+  RegionImplFactory &factory = RegionImplFactory::getInstance();
+  return factory.getSpec(nodeType);
+}
+
+
+std::string Region::executeCommand(const std::vector<std::string> &args) {
+  std::string retVal;
+  if (args.size() < 1) {
+    NTA_THROW << "Invalid empty command specified";
+  }
+
+  if (profilingEnabled_)
+    executeTimer_.start();
+
+  retVal = impl_->executeCommand(args, (UInt64)(-1));
+
+  if (profilingEnabled_)
+    executeTimer_.stop();
+
+  return retVal;
+}
+
+void Region::compute() {
+  if (!initialized_)
+    NTA_THROW << "Region " << getName()
+              << " unable to compute because not initialized";
+
+  if (profilingEnabled_)
+    computeTimer_.start();
+
+  impl_->compute();
+
+  if (profilingEnabled_)
+    computeTimer_.stop();
+
+  return;
+}
+
+/**
+ * These internal methods are called by Network as
+ * part of initialization.
+ */
+
+void Region::evaluateLinks() {
+  for (auto &elem : inputs_) {
+    (elem.second)->initialize(); 
+  }
+}
+
+
+size_t Region::getNodeInputElementCount(const std::string &name) {
+  size_t count = impl_->getNodeInputElementCount(name);
+  return count;
+}
+size_t Region::getNodeOutputElementCount(const std::string &name) {
+  size_t count = impl_->getNodeOutputElementCount(name);
+  return count;
+}
+
+// Ask the implementation how dimensions should be set
+Dimensions Region::askImplForInputDimensions(const std::string &name) const {
+  Dimensions dim;
+  try {
+    dim = impl_->askImplForInputDimensions(name);
+  } catch (Exception &e) {
+      NTA_THROW << "Internal error -- the dimensions for the input " << name
+                << "is unknown. : " << e.what();
+  }
+  return dim;
+}
+Dimensions Region::askImplForOutputDimensions(const std::string &name) const {
+  Dimensions dim;
+  try {
+    dim = impl_->askImplForOutputDimensions(name);
+  } catch (Exception &e) {
+      NTA_THROW << "Internal error -- the dimensions for the input " << name
+                << "is unknown. : " << e.what();
+  }
+  return dim;
+}
+
+Dimensions Region::getInputDimensions(std::string name) const {
+  if (name.empty()) {
+    name = spec_->getDefaultOutputName();
+  }
+  Input* in = getInput(name);
+  NTA_CHECK(in != nullptr) 
+    << "Unknown input (" << name << ") requested on " << name_;
+  return in->getDimensions();
+}
+Dimensions Region::getOutputDimensions(std::string name) const {
+  if (name.empty()) {
+    name = spec_->getDefaultOutputName();
+  }
+  Output* out = getOutput(name);
+  NTA_CHECK(out != nullptr) 
+    << "Unknown output (" << name << ") requested on " << name_;
+  return out->getDimensions();
+}
+
+void Region::setInputDimensions(std::string name, const Dimensions& dim) {
+  if (name.empty()) {
+    name = spec_->getDefaultOutputName();
+  }
+  Input* in = getInput(name);
+  NTA_CHECK(in != nullptr) 
+    << "Unknown input (" << name << ") requested on " << name_;
+  return in->setDimensions(dim);
+}
+void Region::setOutputDimensions(std::string name, const Dimensions& dim) {
+  if (name.empty()) {
+    name = spec_->getDefaultOutputName();
+  }
+  Output* out = getOutput(name);
+  NTA_CHECK(out != nullptr) 
+    << "Unknown output (" << name << ") requested on " << name_;
+  return out->setDimensions(dim);
+}
+
+
+// This is for backward compatability with API
+// Normally Output dimensions are set by setting parameters known to the implementation.
+// This set a global dimension.
+void Region::setDimensions(Dimensions dim) {
+  NTA_CHECK(!initialized_) << "Cannot set region dimensions after initialization.";
+  impl_->setDimensions(dim);
+}
+Dimensions Region::getDimensions() const {
+  return impl_->getDimensions();
+}
+
+
+
+void Region::removeAllIncomingLinks() {
+  InputMap::const_iterator i = inputs_.begin();
+  for (; i != inputs_.end(); i++) {
+    auto &links = i->second->getLinks();
+    while (links.size() > 0) {
+      i->second->removeLink(links[0]);
     }
+  }
+}
+
+void Region::uninitialize() { initialized_ = false; }
+
+void Region::setPhases(std::set<UInt32> &phases) { phases_ = phases; }
+
+std::set<UInt32> &Region::getPhases() { return phases_; }
+
+
+void Region::save(std::ostream &f) const {
+  f << "{\n";
+  f << "name: " << name_ << "\n";
+  f << "nodeType: " << type_ << "\n";
+  f << "phases: [ " << phases_.size() << "\n";
+  for (const auto &phases_phase : phases_) {
+      f << phases_phase << " ";
+  }
+  f << "]\n";
+  f << "outputs: [\n";
+  for(auto out: outputs_) {
+    f << out.first << " " << out.second->getDimensions() << "\n";
+  }
+  f << "]\n";
+  f << "inputs: [\n";
+  for(auto in: inputs_) {
+    f << in.first << " " << in.second->getDimensions() << "\n";
+  }
+  f << "]\n";
+  f << "RegionImpl:\n";
+  // Now serialize the RegionImpl plugin.
+  BundleIO bundle(&f);
+  impl_->serialize(bundle);
+
+  f << "}\n";
+}
+
+void Region::load(std::istream &f) {
+  char bigbuffer[5000];
+  std::string tag;
+  Size count;
+  Dimensions d;
+
+  // Each region is a map -- extract the 5 values in the map
+  f >> tag;
+  NTA_CHECK(tag == "{") << "bad region entry (not a map)";
+
+  // 1. name
+  f >> tag;
+  NTA_CHECK(tag == "name:");
+  f.ignore(1);
+  f.getline(bigbuffer, sizeof(bigbuffer));
+  name_ = bigbuffer;
+
+  // 2. nodeType
+  f >> tag;
+  NTA_CHECK(tag == "nodeType:");
+  f.ignore(1);
+  f.getline(bigbuffer, sizeof(bigbuffer));
+  type_ = bigbuffer;
+
+  // 3. phases
+  f >> tag;
+  NTA_CHECK(tag == "phases:");
+  f >> tag;
+  NTA_CHECK(tag == "[") << "Expecting a sequence of phases.";
+  f >> count;
+  phases_.clear();
+  for (Size i = 0; i < count; i++)
+  {
+    UInt32 val;
+    f >> val;
+    phases_.insert(val);
+  }
+  f >> tag;
+  NTA_CHECK(tag == "]") << "Expected end of sequence of phases.";
+
+  // create inputs and outputs
+  RegionImplFactory &factory = RegionImplFactory::getInstance();
+  spec_ = factory.getSpec(type_);
+  createInputsAndOutputs_();
+
+  // 4. Restore dimensions on outputs
+  {
+    f >> tag;
+    NTA_CHECK(tag == "outputs:");
+    f >> tag;
+    NTA_CHECK(tag == "[") << "Expecting a sequence of outputs.";
+    f >> tag;
+    while(!f.eof() && tag != "]") {
+      f >> d;
+      auto itr = outputs_.find(tag);
+      if (itr != outputs_.end())
+        itr->second->setDimensions(d);
+      f >> tag;
+    }
+    NTA_CHECK(tag == "]") << "Expected end of sequence of outputs.";
+  }
+
+  // 5. Restore dimensions on inputs
+  {
+    f >> tag;
+    NTA_CHECK(tag == "inputs:");
+    f >> tag;
+    NTA_CHECK(tag == "[") << "Expecting a sequence of inputs.";
+    f >> tag;
+    while(!f.eof() && tag != "]") {
+      f >> d;
+      auto itr = inputs_.find(tag);
+      if (itr != inputs_.end())
+        itr->second->setDimensions(d);
+      f >> tag;
+    }
+    NTA_CHECK(tag == "]") << "Expected end of sequence of inputs.";
+  }
+
+  // 6. impl
+  f >> tag;
+  NTA_CHECK(tag == "RegionImpl:") << "Expected beginning of RegionImpl.";
+  f.ignore(1);
+
+  BundleIO bundle(&f);
+  impl_.reset(factory.deserializeRegionImpl(type_, bundle, this));
+
+  f >> tag;
+  NTA_CHECK(tag == "}") << "Expected end of region. Found '" << tag << "'.";
+}
+
+
+
+void Region::enableProfiling() { profilingEnabled_ = true; }
+
+void Region::disableProfiling() { profilingEnabled_ = false; }
+
+void Region::resetProfiling() {
+  computeTimer_.reset();
+  executeTimer_.reset();
+}
+
+const Timer &Region::getComputeTimer() const { return computeTimer_; }
+
+const Timer &Region::getExecuteTimer() const { return executeTimer_; }
+
+bool Region::operator==(const Region &o) const {
+
+  if (initialized_ != o.initialized_ || outputs_.size() != o.outputs_.size() ||
+      inputs_.size() != o.inputs_.size()) {
     return false;
   }
 
-  Region::~Region()
-  {
-    // If there are any links connected to our outputs, this will fail.
-    // We should catch this error in the Network class and give the
-    // user a good error message (regions may be removed either in
-    // Network::removeRegion or Network::~Network())
-    for (auto & elem : outputs_)
-    {
-      delete elem.second;
-      elem.second = nullptr;
+  if (name_ != o.name_ || type_ != o.type_ || 
+      spec_ != o.spec_ || phases_ != o.phases_ ) {
+    return false;
+  }
+  if (getDimensions() != o.getDimensions()) {
+    return false;
+  }
+
+  // Compare Regions's Input (checking only input buffer names and type)
+  static auto compareInput = [](decltype(*inputs_.begin()) a, decltype(*inputs_.begin()) b) {
+    if (a.first != b.first) {
+      return false;
     }
-
-    for (auto & elem : inputs_)
-    {
-      delete elem.second;
-      elem.second = nullptr;
+    auto input_a = a.second;
+    auto input_b = b.second;
+    if (input_a->getDimensions() != input_b->getDimensions()) return false;
+    if (input_a->isInitialized() != input_b->isInitialized()) return false;
+    if (input_a->isInitialized()) {
+      if (input_a->getData().getType() != input_b->getData().getType() ||
+          input_a->getData().getCount() != input_b->getData().getCount())
+        return false;
     }
-
-    delete impl_;
-    delete enabledNodes_;
-
-  }
-
-
-
-  void
-  Region::initialize()
-  {
-
-    if (initialized_)
-      return;
-
-    impl_->initialize();
-    initialized_ = true;
-  }
-
-  bool
-  Region::isInitialized() const
-  {
-    return initialized_;
-  }
-
-  const std::string&
-  Region::getName() const
-  {
-    return name_;
-  }
-
-  const std::string&
-  Region::getType() const
-  {
-    return type_;
-  }
-
-  const Spec*
-  Region::getSpec() const
-  {
-    return spec_;
-  }
-
-  const Spec*
-  Region::getSpecFromType(const std::string& nodeType)
-  {
-    RegionImplFactory & factory = RegionImplFactory::getInstance();
-    return factory.getSpec(nodeType);
-  }
-
-  void
-  Region::registerPyRegion(const std::string module, const std::string className)
-  {
-    RegionImplFactory::registerPyRegion(module, className);
-  }
-
-  void
-  Region::registerCPPRegion(const std::string name, GenericRegisteredRegionImpl* wrapper)
-  {
-    RegionImplFactory::registerCPPRegion(name, wrapper);
-  }
-
-  void
-  Region::unregisterPyRegion(const std::string className)
-  {
-    RegionImplFactory::unregisterPyRegion(className);
-  }
-
-  void
-  Region::unregisterCPPRegion(const std::string name)
-  {
-    RegionImplFactory::unregisterCPPRegion(name);
-  }
-
-  const Dimensions&
-  Region::getDimensions() const
-  {
-    return dims_;
-  }
-
-  void
-  Region::enable()
-  {
-    NTA_THROW << "Region::enable not implemented (region name: " << getName() << ")";
-  }
-
-
-  void
-  Region::disable()
-  {
-    NTA_THROW << "Region::disable not implemented (region name: " << getName() << ")";
-  }
-
-  std::string
-  Region::executeCommand(const std::vector<std::string>& args)
-  {
-    std::string retVal;
-    if (args.size() < 1)
-    {
-      NTA_THROW << "Invalid empty command specified";
+    auto links_a = input_a->getLinks();
+    auto links_b = input_b->getLinks();
+    if (links_a.size() != links_b.size()) {
+      return false;
     }
-
-
-    if (profilingEnabled_)
-      executeTimer_.start();
-
-    retVal = impl_->executeCommand(args, (UInt64)(-1));
-
-    if (profilingEnabled_)
-      executeTimer_.stop();
-
-    return retVal;
-  }
-
-
-  void
-  Region::compute()
-  {
-    if (!initialized_)
-      NTA_THROW << "Region " << getName() << " unable to compute because not initialized";
-
-    if (profilingEnabled_)
-      computeTimer_.start();
-
-    impl_->compute();
-
-    if (profilingEnabled_)
-      computeTimer_.stop();
-
-    return;
-  }
-
-
-
-  /**
-   * These internal methods are called by Network as
-   * part of initialization.
-   */
-
-  size_t
-  Region::evaluateLinks()
-  {
-    int nIncompleteLinks = 0;
-    for (auto & elem : inputs_)
-    {
-      nIncompleteLinks += (elem.second)->evaluateLinks();
-    }
-    return nIncompleteLinks;
-  }
-
-  std::string
-  Region::getLinkErrors() const
-  {
-
-    std::stringstream ss;
-    for (const auto & elem : inputs_)
-    {
-      const std::vector<Link*>& links = elem.second->getLinks();
-      for (const auto & link : links)
-      {
-        if ( (link)->getSrcDimensions().isUnspecified() ||
-             (link)->getDestDimensions().isUnspecified())
-        {
-          ss << (link)->toString() << "\n";
-        }
+    for (size_t i = 0; i < links_a.size(); i++) {
+      if (*(links_a[i]) != *(links_b[i])) {
+        return false;
       }
     }
-
-    return ss.str();
+    return true;
+  };
+  if (!std::equal(inputs_.begin(), inputs_.end(), o.inputs_.begin(),
+                  compareInput)) {
+    return false;
   }
-
-  size_t Region::getNodeOutputElementCount(const std::string& name)
-  {
-    // Use output count if specified in nodespec, otherwise
-    // ask the Impl
-    NTA_CHECK(spec_->outputs.contains(name));
-    size_t count = spec_->outputs.getByName(name).count;
-    if(count == 0)
-    {
-      try
-      {
-        count = impl_->getNodeOutputElementCount(name);
-      } catch(Exception& e) {
-        NTA_THROW << "Internal error -- the size for the output " << name <<
-                     "is unknown. : " << e.what();
-      }
+  // Compare Regions's Output (checking only output buffer names and type.)
+  static auto compareOutput = [](decltype(*outputs_.begin()) a, decltype(*outputs_.begin()) b) {
+    if (a.first != b.first ) {
+      return false;
     }
-
-    return count;
+    auto output_a = a.second;
+    auto output_b = b.second;
+    if (output_a->getDimensions() != output_b->getDimensions()) return false;
+    if (output_a->getData().getType() != output_b->getData().getType() ||
+        output_a->getData().getCount() != output_b->getData().getCount())
+        return false;
+    return true;
+  };
+  if (!std::equal(outputs_.begin(), outputs_.end(), o.outputs_.begin(),
+                  compareOutput)) {
+    return false;
   }
 
-  void Region::initOutputs()
-  {
-    // Some outputs are optional. These outputs will have 0 elementCount in the node
-    // spec and also return 0 from impl->getNodeOutputElementCount(). These outputs still
-    // appear in the output map, but with an array size of 0.
-
-
-    for (auto & elem : outputs_)
-    {
-      const std::string& name = elem.first;
-
-      size_t count = 0;
-      try
-      {
-        count = getNodeOutputElementCount(name);
-      } catch (nupic::Exception& e) {
-        NTA_THROW << "Internal error -- unable to get size of output "
-                  << name << " : " << e.what();
-      }
-      elem.second->initialize(count);
-    }
-  }
-
-  void Region::initInputs() const
-  {
-    auto i = inputs_.begin();
-    for (; i != inputs_.end(); i++)
-    {
-      i->second->initialize();
-    }
-  }
-
-
-
-
-
-  void
-  Region::setDimensions(Dimensions& newDims)
-  {
-    // Can only set dimensions one time
-    if (dims_ == newDims)
-      return;
-
-    if (dims_.isUnspecified())
-    {
-      if (newDims.isDontcare())
-      {
-        NTA_THROW << "Invalid attempt to set region dimensions to dontcare value";
-      }
-
-      if (! newDims.isValid())
-      {
-        NTA_THROW << "Attempt to set region dimensions to invalid value:"
-                  << newDims.toString();
-      }
-
-      dims_ = newDims;
-      dimensionInfo_ = "Specified explicitly in setDimensions()";
-    } else {
-      NTA_THROW << "Attempt to set dimensions of region " << getName()
-                << " to " << newDims.toString()
-                << " but region already has dimensions " << dims_.toString();
-    }
-
-    // can only create the enabled node set after we know the number of dimensions
-    setupEnabledNodeSet();
-
-  }
-
-  void Region::setupEnabledNodeSet()
-  {
-    NTA_CHECK(dims_.isValid());
-
-    if (enabledNodes_ != nullptr)
-    {
-      delete enabledNodes_;
-    }
-
-    size_t nnodes = dims_.getCount();
-    enabledNodes_ = new NodeSet(nnodes);
-
-    enabledNodes_->allOn();
-  }
-
-  const NodeSet& Region::getEnabledNodes() const
-  {
-    if (enabledNodes_ == nullptr)
-    {
-      NTA_THROW << "Attempt to access enabled nodes set before region has been initialized";
-    }
-    return *enabledNodes_;
-  }
-
-
-  void
-  Region::setDimensionInfo(const std::string& info)
-  {
-    dimensionInfo_ = info;
-  }
-
-  const std::string&
-  Region::getDimensionInfo() const
-  {
-    return dimensionInfo_;
-  }
-
-  void
-  Region::removeAllIncomingLinks()
-  {
-    InputMap::const_iterator i = inputs_.begin();
-    for (; i != inputs_.end(); i++)
-    {
-      std::vector<Link*> links = i->second->getLinks();
-      for (auto & links_link : links)
-      {
-        i->second->removeLink(links_link);
-
-      }
-    }
-
-  }
-
-  void
-  Region::uninitialize()
-  {
-    initialized_ = false;
-  }
-
-  void
-  Region::setPhases(std::set<UInt32>& phases)
-  {
-    phases_ = phases;
-  }
-
-  std::set<UInt32>&
-  Region::getPhases()
-  {
-    return phases_;
-  }
-
-  void
-  Region::serializeImpl(BundleIO& bundle)
-  {
-    impl_->serialize(bundle);
-  }
-
-  void Region::write(RegionProto::Builder& proto) const
-  {
-    auto dimensionsProto = proto.initDimensions(dims_.size());
-    for (UInt i = 0; i < dims_.size(); ++i)
-    {
-      dimensionsProto.set(i, dims_[i]);
-    }
-    auto phasesProto = proto.initPhases(phases_.size());
-    UInt i = 0;
-    for (auto elem : phases_)
-    {
-      phasesProto.set(i++, elem);
-    }
-    proto.setNodeType(type_.c_str());
-    auto implProto = proto.getRegionImpl();
-    impl_->write(implProto);
-  }
-
-  void Region::read(RegionProto::Reader& proto)
-  {
-    dims_.clear();
-    for (auto elem : proto.getDimensions())
-    {
-      dims_.push_back(elem);
-    }
-
-    phases_.clear();
-    for (auto elem : proto.getPhases())
-    {
-      phases_.insert(elem);
-    }
-
-    auto implProto = proto.getRegionImpl();
-    RegionImplFactory& factory = RegionImplFactory::getInstance();
-    spec_ = factory.getSpec(type_);
-    impl_ = factory.deserializeRegionImpl(
-        proto.getNodeType().cStr(), implProto, this);
-  }
-
-  void
-  Region::enableProfiling()
-  {
-    profilingEnabled_ = true;
-  }
-
-  void
-  Region::disableProfiling()
-  {
-    profilingEnabled_ = false;
-  }
-
-  void
-  Region::resetProfiling()
-  {
-    computeTimer_.reset();
-    executeTimer_.reset();
-  }
-
-  const Timer& Region::getComputeTimer() const
-  {
-    return computeTimer_;
-  }
-
-  const Timer& Region::getExecuteTimer() const
-  {
-    return executeTimer_;
-  }
-
+  return true;
 }
+
+
+
+
+
+// Internal methods called by RegionImpl.
+
+Output *Region::getOutput(const std::string &name) const {
+  auto o = outputs_.find(name);
+  if (o == outputs_.end())
+    return nullptr;
+  return o->second;
+}
+
+Input *Region::getInput(const std::string &name) const {
+  auto i = inputs_.find(name);
+  if (i == inputs_.end())
+    return nullptr;
+  return i->second;
+}
+
+// Called by Network during serialization
+const std::map<std::string, Input *> &Region::getInputs() const {
+  return inputs_;
+}
+
+const std::map<std::string, Output *> &Region::getOutputs() const {
+  return outputs_;
+}
+
+
+const Array& Region::getOutputData(const std::string &outputName) const {
+  auto oi = outputs_.find(outputName);
+  if (oi == outputs_.end())
+    NTA_THROW << "getOutputData -- unknown output '" << outputName
+              << "' on region " << getName();
+
+  const Array& data = oi->second->getData();
+  return data;
+}
+
+const Array& Region::getInputData(const std::string &inputName) const {
+  auto ii = inputs_.find(inputName);
+  if (ii == inputs_.end())
+    NTA_THROW << "getInput -- unknown input '" << inputName << "' on region "
+              << getName();
+
+  const Array & data = ii->second->getData();
+  return data;
+}
+
+void Region::prepareInputs() {
+  // Ask each input to prepare itself
+  for (InputMap::const_iterator i = inputs_.begin(); i != inputs_.end(); i++) {
+    i->second->prepare();
+  }
+}
+
+
+// setParameter
+
+void Region::setParameterInt32(const std::string &name, Int32 value) {
+  impl_->setParameterInt32(name, (Int64)-1, value);
+}
+
+void Region::setParameterUInt32(const std::string &name, UInt32 value) {
+  impl_->setParameterUInt32(name, (Int64)-1, value);
+}
+
+void Region::setParameterInt64(const std::string &name, Int64 value) {
+  impl_->setParameterInt64(name, (Int64)-1, value);
+}
+
+void Region::setParameterUInt64(const std::string &name, UInt64 value) {
+  impl_->setParameterUInt64(name, (Int64)-1, value);
+}
+
+void Region::setParameterReal32(const std::string &name, Real32 value) {
+  impl_->setParameterReal32(name, (Int64)-1, value);
+}
+
+void Region::setParameterReal64(const std::string &name, Real64 value) {
+  impl_->setParameterReal64(name, (Int64)-1, value);
+}
+
+void Region::setParameterBool(const std::string &name, bool value) {
+  impl_->setParameterBool(name, (Int64)-1, value);
+}
+
+// getParameter
+
+Int32 Region::getParameterInt32(const std::string &name) const {
+  return impl_->getParameterInt32(name, (Int64)-1);
+}
+
+Int64 Region::getParameterInt64(const std::string &name) const {
+  return impl_->getParameterInt64(name, (Int64)-1);
+}
+
+UInt32 Region::getParameterUInt32(const std::string &name) const {
+  return impl_->getParameterUInt32(name, (Int64)-1);
+}
+
+UInt64 Region::getParameterUInt64(const std::string &name) const {
+  return impl_->getParameterUInt64(name, (Int64)-1);
+}
+
+Real32 Region::getParameterReal32(const std::string &name) const {
+  return impl_->getParameterReal32(name, (Int64)-1);
+}
+
+Real64 Region::getParameterReal64(const std::string &name) const {
+  return impl_->getParameterReal64(name, (Int64)-1);
+}
+
+bool Region::getParameterBool(const std::string &name) const {
+  return impl_->getParameterBool(name, (Int64)-1);
+}
+
+// array parameters
+
+void Region::getParameterArray(const std::string &name, Array &array) const {
+  impl_->getParameterArray(name, (Int64)-1, array);
+}
+
+void Region::setParameterArray(const std::string &name, const Array &array) {
+  impl_->setParameterArray(name, (Int64)-1, array);
+}
+
+void Region::setParameterString(const std::string &name, const std::string &s) {
+  impl_->setParameterString(name, (Int64)-1, s);
+}
+
+std::string Region::getParameterString(const std::string &name) {
+  return impl_->getParameterString(name, (Int64)-1);
+}
+
+bool Region::isParameter(const std::string &name) const {
+  return (spec_->parameters.contains(name));
+}
+
+
+} // namespace nupic

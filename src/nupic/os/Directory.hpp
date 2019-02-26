@@ -1,6 +1,6 @@
 /* ---------------------------------------------------------------------
  * Numenta Platform for Intelligent Computing (NuPIC)
- * Copyright (C) 2013, Numenta, Inc.  Unless you have an agreement
+ * Copyright (C) 2013-2018, Numenta, Inc.  Unless you have an agreement
  * with Numenta, Inc., for a separate license for this software code, the
  * following terms and conditions apply:
  *
@@ -22,88 +22,90 @@
 
 /** @file */
 
-
 #ifndef NTA_DIRECTORY_HPP
 #define NTA_DIRECTORY_HPP
 
 //----------------------------------------------------------------------
 
-#include <apr-1/apr.h>
-#include <apr-1/apr_file_info.h>
 #include <string>
+#include <nupic/os/Path.hpp>
+#include <nupic/os/ImportFilesystem.hpp>  // defines fs, er, etc.
 
 //----------------------------------------------------------------------
 
-namespace nupic
-{
-  class Path;
-  
-  namespace Directory
-  {
-    // check if a directory exists
-    bool exists(const std::string & path);
+namespace nupic {
+class Path;
 
-    bool empty(const std::string & path);
-    
-    // get current working directory
-    std::string getCWD();
-		
-    // set current working directories
-    void setCWD(const std::string & path);
+class Directory {
+public:
+	// check if a directory exists
+	static bool exists(const std::string &path);
 
-    // Copy directory tree rooted in 'source' to 'destination'
-    void copyTree(const std::string & source, const std::string & destination);
-    		
-    // Remove directory tree rooted in 'path'
-    bool removeTree(const std::string & path, bool noThrow=false);
-		
-    // Create directory 'path' including all parent directories if missing
-    // returns the first directory that was actually created.
-    //
-    // For example if path is /A/B/C/D 
-    //    if /A/B/C/D exists it returns ""
-    //    if /A/B exists it returns /A/B/C
-    //    if /A doesn't exist it returns /A/B/C/D
-    // 
-    // Failures will throw an exception
-    void create(const std::string & path, bool otherAccess=false, bool recursive=false);
+	// true if the directory is empty
+	static bool empty(const std::string &path);
 
-    std::string createTemporary(const std::string &templatePath);
+	// return the amount of available space on this path's device.
+	static Size free_space(const std::string & path);
 
-    struct Entry : public apr_finfo_t
-    {
-      enum Type { FILE, DIRECTORY, LINK };
-			
-      Type type;
-      std::string path;
-    };
+	// get current working directory
+	static std::string getCWD();
 
-    class Iterator
-    {
-    public:
+	// set current working directories
+	static void setCWD(const std::string &path);  // be careful about using this.
 
-      Iterator(const Path & path);		
-      Iterator(const std::string & path);
-      ~Iterator();
-		
-      // Resets directory to start. Subsequent call to next() 
-      // will retrieve the first entry
-      void reset();
-      // get next directory entry
-      Entry * next(Entry & e);
-		
-    private:
-      Iterator();
-      Iterator(const Iterator &);
-		
-      void init(const std::string & path);
-    private:
-      std::string path_;
-      apr_dir_t * handle_;
-      apr_pool_t * pool_;
-    };
-  }
-}
+	// Copy directory tree rooted in 'source' to 'destination'
+	static void copyTree(const std::string &source, const std::string &destination);
+
+	// Remove directory tree rooted in 'path'
+	static bool removeTree(const std::string &path, bool noThrow = false);
+
+	// Create directory 'path' including all parent directories if missing
+	// returns the first directory that was actually created.
+	//
+	// For example if path is /A/B/C/D
+	//    if /A/B/C/D exists it returns ""
+	//    if /A/B exists it returns /A/B/C
+	//    if /A doesn't exist it returns /A/B/C/D
+	//
+	// Failures will throw an exception
+	static void create(const std::string &path, bool otherAccess = false, bool recursive = false);
+
+	static std::string list(const std::string &path, std::string indent = "");
+};
+
+
+struct Entry {
+  enum Type { FILE, DIRECTORY, LINK, OTHER };
+
+  Type type;
+  std::string path;         // full absolute path
+  std::string filename;     // just the filename and extension or directory name
+};
+
+class Iterator {
+public:
+  Iterator(const nupic::Path & path);
+  Iterator(const std::string & path);
+  ~Iterator() {}
+
+  // Resets directory to start. Subsequent call to next()
+  // will retrieve the first entry
+  void reset();
+
+  // get next directory entry
+  Entry *next(Entry &e);
+
+private:
+  Iterator() = delete;
+  Iterator(const Iterator &) = delete;
+
+private:
+  fs::path p_;
+  fs::directory_iterator current_;
+  fs::directory_iterator end_;
+
+};
+} // namespace nupic
 
 #endif // NTA_DIRECTORY_HPP
 

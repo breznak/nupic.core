@@ -20,135 +20,154 @@
  * ---------------------------------------------------------------------
  */
 
-/** @file 
+/** @file
 Definition of Spec data structures
 */
 
 #ifndef NTA_SPEC_HPP
 #define NTA_SPEC_HPP
 
-#include <nupic/types/Types.hpp>
-#include <nupic/ntypes/Collection.hpp>
-#include <string>
 #include <map>
+#include <nupic/ntypes/Collection.hpp>
+#include <nupic/types/Types.hpp>
+#include <string>
 
-namespace nupic
-{
-  class InputSpec
-  {
-  public:  
-    InputSpec() {}
-    InputSpec(
-      std::string description, 
-      NTA_BasicType dataType, 
-      UInt32 count, 
-      bool required, 
-      bool regionLevel, 
-      bool isDefaultInput, 
-      bool requireSplitterMap = true);
+namespace nupic {
+class InputSpec {
+public:
+  InputSpec() {}
+  InputSpec(std::string description,
+            NTA_BasicType dataType,
+            UInt32 count = 0,
+            bool required = false,
+            bool regionLevel = true,
+            bool isDefaultInput = false);
+    bool operator==(const InputSpec &other) const;
+    inline bool operator!=(const InputSpec &other) const {
+    return !operator==(other);
+  }
+  std::string description;   // description of input
+	
+  NTA_BasicType dataType;    // declare type of input
 
-    std::string description;
-    NTA_BasicType dataType;
-    // TBD: Omit? isn't it always of unknown size?
-    // 1 = scalar; > 1 = array of fixed sized; 0 = array of unknown size 
-    UInt32 count; 
-    // TBD. Omit? what is "required"? Is it ok to be zero length?
-    bool required;
-    bool regionLevel;
-    bool isDefaultInput;
-    bool requireSplitterMap;
-  };
+  // width of buffer if fixed. 0 means variable.
+  // If non-zero positive value it means this region was developed
+	// to accept a fixed sized 1D array only.
+  UInt32 count;             
+	
+  bool required;             // true if input must be connected.
+	
+  bool regionLevel;          // if true, this means this input can propagate its 
+                             // dimensions to/from the region's dimensions.
+	
+  bool isDefaultInput;       // if True, assume this if input name not given 
+	                           // in functions involving inputs of a region.
+};
 
-  class OutputSpec
-  {
-  public:
-    OutputSpec() {}
-    OutputSpec(std::string description, const 
-               NTA_BasicType dataType, size_t count, bool regionLevel, bool isDefaultOutput);
+class OutputSpec {
+public:
+  OutputSpec() {}
+  OutputSpec(std::string description,
+             const NTA_BasicType dataType,
+             size_t count = 0,              // set size of buffer, 0 means unknown size.
+             bool regionLevel = true,
+             bool isDefaultOutput = false);
+    bool operator==(const OutputSpec &other) const;
+    inline bool operator!=(const OutputSpec &other) const {
+    return !operator==(other);
+  }
+  std::string description;   // description of output
+	
+	NTA_BasicType dataType;    // The type of the output buffer.
 
-    std::string description;
-    NTA_BasicType dataType;
-    // Size, in number of elements. If size is fixed, specify it here. 
-    // Value of 0 means it is determined dynamically
-    size_t count; 
-    bool regionLevel;
-    bool isDefaultOutput;
-  };
+  size_t count;              // Size, in number of elements. If size is fixed.  
+	                           // If non-zero value it means this region 
+														 // was developed to output a fixed sized 1D array only.
+                             // if 0, call askImplForOutputDimensions() to get dimensions.
 
-  class CommandSpec
-  {
-  public:
-    CommandSpec() {}
-    CommandSpec(std::string description);
+  bool regionLevel;          // If true, this output is can get its dimensions from
+                             // the region dimensions.
 
-    std::string description;
+  bool isDefaultOutput;      // if true, use this output for region if output name not given
+	                           // in functions involving outputs on a region.
+};
 
-  };
+class CommandSpec {
+public:
+  CommandSpec() {}
+  CommandSpec(std::string description);
+  bool operator==(const CommandSpec &other) const;
+  inline bool operator!=(const CommandSpec &other) const {
+    return !operator==(other);
+  }
+  std::string description;
+};
 
-  class ParameterSpec
-  {
-  public:
-    typedef enum { CreateAccess, ReadOnlyAccess, ReadWriteAccess } AccessMode;
+class ParameterSpec {
+public:
+  typedef enum { CreateAccess, ReadOnlyAccess, ReadWriteAccess } AccessMode;
 
-    ParameterSpec() {}
-    /**
-     * @param defaultValue -- a JSON-encoded value
-     */
-    ParameterSpec(std::string description, 
-                  NTA_BasicType dataType, size_t count, 
-                  std::string constraints, std::string defaultValue, 
-                  AccessMode accessMode);
+  ParameterSpec() {}
+  /**
+   * @param defaultValue -- a JSON-encoded value
+   */
+  ParameterSpec(std::string description, NTA_BasicType dataType, size_t count,
+                std::string constraints, std::string defaultValue,
+                AccessMode accessMode);
+  bool operator==(const ParameterSpec &other) const;
+  inline bool operator!=(const ParameterSpec &other) const {
+    return !operator==(other);
+  }
+  std::string description;
+
+  // [open: current basic types are bytes/{u}int16/32/64, real32/64, BytePtr. Is
+  // this the right list? Should we have std::string, jsonstd::string?]
+  NTA_BasicType dataType;
+  // 1 = scalar; > 1 = array o fixed sized; 0 = array of unknown size
+  // TODO: should be size_t? Serialization issues?
+  size_t count;
+  std::string constraints;
+  std::string defaultValue; // JSON representation; empty std::string means
+                            // parameter is required
+  AccessMode accessMode;
+};
+
+class Spec {
+public:
+  // Return a printable string with Spec information
+  // TODO: should this be in the base API or layered? In the API right
+  // now since we do not build layered libraries.
+  std::string toString() const;
+  bool operator==(const Spec &other) const;
+  inline bool operator!=(const Spec &other) const { return !operator==(other); }
+  // Some RegionImpls support only a single node in a region.
+  // Such regions always have dimension [1]
+  bool singleNodeOnly;
+
+  // Description of the node as a whole
+  std::string description;
+
+  // containers for the components of the spec.
+  Collection<InputSpec> inputs;
+  Collection<OutputSpec> outputs;
+  Collection<CommandSpec> commands;
+  Collection<ParameterSpec> parameters;
 
 
-    std::string description;
+  Spec();
 
-    // [open: current basic types are bytes/{u}int16/32/64, real32/64, BytePtr. Is this 
-    // the right list? Should we have std::string, jsonstd::string?]
-    NTA_BasicType    dataType;
-    // 1 = scalar; > 1 = array o fixed sized; 0 = array of unknown size 
-    // TODO: should be size_t? Serialization issues?
-    size_t      count; 
-    std::string constraints;
-    std::string defaultValue; // JSON representation; empty std::string means parameter is required
-    AccessMode  accessMode;
+  std::string getDefaultOutputName() const;
+  std::string getDefaultInputName() const;
 
-  };
+  // a value that applys to the count field in inputs, outputs, parameters.
+  // It means that the field is an array and its size is not fixed.
+  static const int VARIABLE = 0; 
 
+  // a value that applys to the count field in inputs, outputs, parameters.
+  // It means that the field not an array and has a single scaler value.
+  static const int SCALER = 1; 
 
-  struct Spec
-  {
-    // Return a printable string with Spec information
-    // TODO: should this be in the base API or layered? In the API right
-    // now since we do not build layered libraries. 
-    std::string toString() const;
-
-    // Some RegionImpls support only a single node in a region. 
-    // Such regions always have dimension [1]
-    bool singleNodeOnly;
-
-    // Description of the node as a whole
-    std::string description;
-
-    Collection<InputSpec> inputs;
-    Collection<OutputSpec> outputs;
-    Collection<CommandSpec> commands;
-    Collection<ParameterSpec> parameters;
-
-#ifdef NTA_INTERNAL
-
-    Spec();
-
-    // TODO: decide whether/how to wrap these
-    std::string getDefaultOutputName() const;
-    std::string getDefaultInputName() const;
-
-    // TODO: need Spec validation, to make sure 
-    // that default input/output are defined
-    // Currently this is checked in getDefault*, above
-
-#endif // NTA_INTERNAL
-
-  };
+};
 
 } // namespace nupic
 

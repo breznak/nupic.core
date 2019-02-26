@@ -25,55 +25,68 @@
  */
 
 #define SLEEP_MICROSECONDS (100 * 1000)
+#define SLEEP_MILLISECONDS (100)
+
+#if defined(WIN32)
+#include <windows.h>
+#elif defined(__UNIX__)
+#include <unistd.h>
+#else
+#endif
+
 
 #include <nupic/utils/Log.hpp>
 #include <nupic/os/Timer.hpp>
 #include <math.h> // fabs
-#include <apr-1/apr_time.h>
 #include <gtest/gtest.h>
+
+#if defined(WIN32)
+#define nap()   Sleep(SLEEP_MILLISECONDS);
+#else
+#define nap()   usleep(SLEEP_MICROSECONDS);
+#endif
 
 using namespace nupic;
 
-TEST(TimerTest, Basic)
-{
-// Tests are minimal because we have no way to run performance-sensitive tests in a controlled
-// environment.
+TEST(TimerTest, Basic) {
+  // Tests are minimal because we have no way to run performance-sensitive tests
+  // in a controlled environment.
 
   Timer t1;
   Timer t2(/* startme= */ true);
 
   ASSERT_FALSE(t1.isStarted());
-  ASSERT_EQ(t1.getElapsed(), 0.0);
-  ASSERT_EQ(t1.getStartCount(), 0);
+  ASSERT_EQ(t1.getElapsed(), 0.0f);
+  ASSERT_EQ(t1.getStartCount(), 0u);
   EXPECT_STREQ("[Elapsed: 0 Starts: 0]", t1.toString().c_str());
 
-  apr_sleep(SLEEP_MICROSECONDS);
+
+  nap();
 
   ASSERT_TRUE(t2.isStarted());
-  ASSERT_EQ(t2.getStartCount(), 1);
+  ASSERT_EQ(t2.getStartCount(), 1u);
   ASSERT_GT(t2.getElapsed(), 0);
   Real64 t2elapsed = t2.getElapsed();
 
   t1.start();
-  apr_sleep(SLEEP_MICROSECONDS);
+  nap();
   t1.stop();
 
   t2.stop();
-  ASSERT_EQ(t1.getStartCount(), 1);
+  ASSERT_EQ(t1.getStartCount(), 1u);
   ASSERT_GT(t1.getElapsed(), 0);
   ASSERT_GT(t2.getElapsed(), t2elapsed);
   ASSERT_GT(t2.getElapsed(), t1.getElapsed());
 
   t1.start();
   t1.stop();
-  ASSERT_EQ(t1.getStartCount(), 2);
+  ASSERT_EQ(t1.getStartCount(), 2u);
 }
 
-TEST(TimerTest, Drift)
-{
-// Test start/stop delay accumulation
+TEST(TimerTest, Drift) {
+  // Test start/stop delay accumulation
   Timer t;
-  const UInt EPOCHS = 1000000; // 1M
+  const UInt EPOCHS = 1000000u; // 1M
   const UInt EPSILON = 5; // tolerate 5us drift on 1M restarts
   for(UInt i=0; i<EPOCHS; i++){
     t.start();

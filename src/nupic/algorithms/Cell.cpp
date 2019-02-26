@@ -46,10 +46,8 @@ _freeSegments(0)
  */
 static bool cellMatchPythonSegOrder = false;
 
-void Cell::setSegmentOrder(bool matchPythonOrder)
-{
-  if (matchPythonOrder)
-  {
+void Cell::setSegmentOrder(bool matchPythonOrder) {
+  if (matchPythonOrder) {
     std::cout << "*** Python segment match turned on for Cells4\n";
   }
   cellMatchPythonSegOrder = matchPythonOrder;
@@ -61,20 +59,17 @@ void Cell::setSegmentOrder(bool matchPythonOrder)
  * allocated ones that have been previously "freed" (but we kept
  * the memory allocated), or by allocating a new one.
  */
-UInt Cell::getFreeSegment(const Segment::InSynapses& synapses,
-                    Real initFrequency,
-                    bool sequenceSegmentFlag,
-                    Real permConnected,
-                    UInt iteration)
-{
-  NTA_ASSERT(! synapses.empty());
+UInt Cell::getFreeSegment(const Segment::InSynapses &synapses,
+                          Real initFrequency, bool sequenceSegmentFlag,
+                          Real permConnected, UInt iteration) {
+  NTA_ASSERT(!synapses.empty());
 
   UInt segIdx = 0;
 
   if (cellMatchPythonSegOrder) {
     // for unit tests where segment order matters
 
-    segIdx = _segments.size();
+    segIdx = (UInt)_segments.size();
     _segments.resize(_segments.size() + 1);
 
   } else {
@@ -86,8 +81,8 @@ UInt Cell::getFreeSegment(const Segment::InSynapses& synapses,
     // it to 2 different segments!
 
     if (_freeSegments.empty()) {
-      segIdx = _segments.size();
-      //TODO: Should we grow by larger amounts here?
+      segIdx = (UInt)_segments.size();
+      // TODO: Should we grow by larger amounts here?
       _segments.resize(_segments.size() + 1);
     } else {
       segIdx = _freeSegments.back();
@@ -95,13 +90,12 @@ UInt Cell::getFreeSegment(const Segment::InSynapses& synapses,
     }
   }
 
-  NTA_ASSERT(segIdx < _segments.size());
-  NTA_ASSERT(not_in(segIdx, _freeSegments));
+  NTA_ASSERT(segIdx < (UInt)_segments.size());
+  NTA_ASSERT(std::find(_freeSegments.cbegin(), _freeSegments.cend(), segIdx) == _freeSegments.cend());
   NTA_ASSERT(_segments[segIdx].empty()); // important in case we push_back
 
-  _segments[segIdx] =
-  Segment(synapses, initFrequency, sequenceSegmentFlag,
-          permConnected, iteration);
+  _segments[segIdx] = Segment(synapses, initFrequency, sequenceSegmentFlag,
+                              permConnected, iteration);
 
   return segIdx;
 }
@@ -110,20 +104,18 @@ UInt Cell::getFreeSegment(const Segment::InSynapses& synapses,
 /**
  * Update the duty cycle of each segment in this cell
  */
-void Cell::updateDutyCycle(UInt iterations)
-{
-  for (UInt i = 0; i != _segments.size(); ++i)
-  {
-    if (!_segments[i].empty())
-    {
+void Cell::updateDutyCycle(UInt iterations) {
+  for (UInt i = 0; i != _segments.size(); ++i) {
+    if (!_segments[i].empty()) {
       _segments[i].dutyCycle(iterations, false, false);
     }
   }
 }
 
 //-----------------------------------------------------------------------------
-void Cell::save(std::ostream& outStream) const
-{
+
+//-----------------------------------------------------------------------------
+void Cell::save(std::ostream &outStream) const {
   outStream << _segments.size() << ' ';
   // TODO: save only non-empty segments
   for (UInt i = 0; i != _segments.size(); ++i) {
@@ -133,8 +125,7 @@ void Cell::save(std::ostream& outStream) const
 }
 
 //----------------------------------------------------------------------------
-void Cell::load(std::istream& inStream)
-{
+void Cell::load(std::istream &inStream) {
   UInt n = 0;
 
   inStream >> n;
@@ -142,9 +133,15 @@ void Cell::load(std::istream& inStream)
   _segments.resize(n);
   _freeSegments.resize(0);
 
-  for (UInt i = 0; i != (UInt) n; ++i) {
+  for (UInt i = 0; i != (UInt)n; ++i) {
     _segments[i].load(inStream);
     if (_segments[i].empty())
       _freeSegments.push_back(i);
   }
+}
+bool Cell::operator==(const Cell &other) const {
+  if (_freeSegments != other._freeSegments) {
+    return false;
+  }
+  return _segments == other._segments;
 }

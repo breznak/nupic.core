@@ -18,65 +18,88 @@
 #
 # http://numenta.org/licenses/
 # -----------------------------------------------------------------------------
+#  Features:
+#  - All third party modules are downloaded form the internet and build.
+#
+#  - Isolated so does not require being downloaded more than once.
+#
+#  - It is possible to manually preload the distribution packages (for air gap computers)
+#     1) On some other machine, download the following:
+#        https://dl.bintray.com/boostorg/release/1.69.0/source/boost_1_69_0.tar.gz
+#        https://github.com/jbeder/yaml-cpp/archive/yaml-cpp-0.6.2.tar.gz
+#        https://github.com/pybind/pybind11/archive/v2.2.4.tar.gz
+#        https://github.com/abseil/googletest/archive/release-1.8.1.tar.gz
+#        http://bitbucket.org/eigen/eigen/get/3.3.7.tar.bz2
+#     2) copy these to <repository>/build/ThirdParty/share/
+#
+#  NOTE:  This is executed by the top level CMakeLists.txt via the bootstrap.cmake
+#         by executing "cd build/scripts; cmake ../.."
+#         Resulting paths are passed back via the file "build/ThirdParty/results.txt".
+#
+#         This has a separate cache so not affected by make clean.
+#          
+# If you need to re-build the ThirdParty libaries, 
+#  - cd to repository
+#  - delete build  (rm -r build)
+#  - create folders build/scripts (mkdir -d build/scripts)
+#  - cd build/scripts
+#  - cmake ../..
+# Note: on MSVC, run startupMSVC.bat after deleting the build folder.
 
-cmake_minimum_required(VERSION 2.8)
-project(nupic_core_main CXX)
+cmake_minimum_required(VERSION 3.3)
+project(nupic_core CXX)
 
 set(CMAKE_VERBOSE_MAKEFILE OFF)
 
-set_directory_properties(PROPERTIES EP_BASE "${EP_BASE}")
-
-# Shorter aliases for static library prefix and suffix.
-set(STATIC_PRE ${CMAKE_STATIC_LIBRARY_PREFIX})
-set(STATIC_SUF ${CMAKE_STATIC_LIBRARY_SUFFIX})
-# This is the library prefix path.
-set(LIB_PRE ${EP_BASE}/Install/lib)
-# This is the include path.
-set(INCLUDE_PRE ${EP_BASE}/Install/include)
-# The full prefix path for binaries.
-set(BIN_PRE ${EP_BASE}/Install/bin)
-
+include(GNUInstallDirs)
 include(ExternalProject)
+set(EP_BASE ${CMAKE_BINARY_DIR})
+if (MSVC)
+  set(EXTERNAL_CXX_FLAGS /EHsc "$<$<CONFIG:Release>:/MD>" "$<$<CONFIG:Debug>:/MDd>")
+else()
+  set(EXTERNAL_CXX_FLAGS -fPIC)
+endif()
+add_compile_options(${EXTERNAL_CXX_FLAGS})
 
-set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}")
+message(STATUS "external import")
+message(STATUS "   CMAKE_INSTALL_PREFIX  = ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "   CMAKE_BUILD_TYPE      = ${CMAKE_BUILD_TYPE}")
+message(STATUS "   EXTERNAL_CXX_FLAGS    = ${EXTERNAL_CXX_FLAGS}")
+message(STATUS "   NEEDS_BOOST           = ${NEEDS_BOOST}")
+message(STATUS "   BINDING_BUILD         = ${BINDING_BUILD}")
 
-include(CapnProto)
 
-include(Swig)
+set(EXPORT_FILE_NAME "${EP_BASE}/results.txt")
+FILE(REMOVE "${EXPORT_FILE_NAME}")
 
-include(Apr1Lib)
-set(APR1_STATIC_LIB_TARGET ${APR1_STATIC_LIB_TARGET} PARENT_SCOPE)
-set(APR1_STATIC_LIB_INC_DIR ${APR1_STATIC_LIB_INC_DIR} PARENT_SCOPE)
-list(APPEND EXTERNAL_INCLUDE_DIRS
-     ${APR1_STATIC_LIB_INC_DIR}
-     "${APR1_STATIC_LIB_INC_DIR}/apr-1"
-)
+################
+# Yaml-cpp
+include(YamlCppLib.cmake)
 
-# AprUtil1Lib MUST be imported after Apr1Lib due to depencies on exported
-# properties
-include(AprUtil1Lib)
-set(APRUTIL1_STATIC_LIB_TARGET ${APRUTIL1_STATIC_LIB_TARGET} PARENT_SCOPE)
-set(APRUTIL1_STATIC_LIB_INC_DIR ${APRUTIL1_STATIC_LIB_INC_DIR} PARENT_SCOPE)
-list(APPEND EXTERNAL_INCLUDE_DIRS ${APRUTIL1_STATIC_LIB_INC_DIR})
 
-include(YamlLib)
-set(YAML_STATIC_LIB_TARGET ${YAML_STATIC_LIB_TARGET} PARENT_SCOPE)
+################
+# Eigen
+include(eigen.cmake)
 
-include(YamlCppLib)
-set(YAML_CPP_STATIC_LIB_TARGET ${YAML_CPP_STATIC_LIB_TARGET} PARENT_SCOPE)
-set(YAML_CPP_STATIC_LIB_INC_DIR ${YAML_CPP_STATIC_LIB_INC_DIR} PARENT_SCOPE)
-list(APPEND EXTERNAL_INCLUDE_DIRS ${YAML_CPP_STATIC_LIB_INC_DIR})
 
-include(Zlib)
-set(Z_STATIC_LIB_TARGET ${Z_STATIC_LIB_TARGET} PARENT_SCOPE)
-set(Z_STATIC_LIB_INC_DIR ${Z_STATIC_LIB_INC_DIR} PARENT_SCOPE)
-list(APPEND EXTERNAL_INCLUDE_DIRS ${Z_STATIC_LIB_INC_DIR})
+##################
+#  Boost
+if(NEEDS_BOOST)
+  include(Boost.cmake)
+endif()
 
-# Add vendored prebuilt library include paths.
-list(APPEND EXTERNAL_INCLUDE_DIRS
-     "${PROJECT_SOURCE_DIR}/common/include")
 
-# Convenience variable that wraps all external include directories.
-list(APPEND EXTERNAL_INCLUDE_DIRS ${CAPNP_INCLUDE_DIRS})
+##################
+# gtest
+include(gtest.cmake)
 
-set(EXTERNAL_INCLUDE_DIRS ${EXTERNAL_INCLUDE_DIRS} PARENT_SCOPE)
+
+##################
+# pybind11
+string(REGEX MATCH "Python" match ${BINDING_BUILD})
+if(match)
+  include(pybind11.cmake)
+endif()
+
+
+

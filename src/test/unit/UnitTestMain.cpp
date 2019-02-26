@@ -20,31 +20,18 @@
  * ---------------------------------------------------------------------
  */
 
-/** @file 
+/** @file
 Google test main program
 */
 
-#if defined(NTA_OS_WINDOWS)
-// Exclude rarely-used stuff from Windows headers
-#define WIN32_LEAN_AND_MEAN
-#endif
 
-#include <nupic/utils/Log.hpp>
 #include <gtest/gtest.h>
+#include <nupic/utils/Log.hpp>
 
 using namespace std;
 using namespace nupic;
 
-// APR must be explicit initialized
-#include <apr-1/apr_general.h>
-
-int main(int argc, char ** argv) {
-
-  // initialize APR
-  apr_status_t    result;
-  result = apr_app_initialize(&argc, (char const *const **)&argv, nullptr /*env*/);
-  if (result) 
-    NTA_THROW << "error initializing APR. Err code: " << result;
+int main(int argc, char **argv) {
 
   // initialize GoogleTest
   ::testing::InitGoogleTest(&argc, argv);

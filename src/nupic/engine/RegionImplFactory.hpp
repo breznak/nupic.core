@@ -1,6 +1,6 @@
 /* ---------------------------------------------------------------------
  * Numenta Platform for Intelligent Computing (NuPIC)
- * Copyright (C) 2013-2015, Numenta, Inc.  Unless you have an agreement
+ * Copyright (C) 2013-2018, Numenta, Inc.  Unless you have an agreement
  * with Numenta, Inc., for a separate license for this software code, the
  * following terms and conditions apply:
  *
@@ -24,7 +24,7 @@
  * Definition of the RegionImpl Factory API
  *
  * A RegionImplFactory creates RegionImpls upon request.
- * Pynode creation is delegated to another class (TBD).
+ * Pynode creation is delegated to pyBindRegion via RegisteredRegionImplPy
  * Because all C++ RegionImpls are compiled in to NuPIC,
  * the RegionImpl factory knows about them explicitly.
  *
@@ -34,84 +34,66 @@
 #define NTA_REGION_IMPL_FACTORY_HPP
 
 #include <map>
+#include <memory>
 #include <string>
 
-#include <boost/shared_ptr.hpp>
-#include <capnp/any.h>
 
-namespace nupic
-{
 
-  class RegionImpl;
-  class Region;
-  class DynamicPythonLibrary;
-  struct Spec;
-  class BundleIO;
-  class ValueMap;
-  class GenericRegisteredRegionImpl;
 
-  class RegionImplFactory
-  {
-  public:
-    static RegionImplFactory & getInstance();
+namespace nupic {
 
-    // RegionImplFactory is a lightweight object
-    ~RegionImplFactory() {};
+class RegionImpl;
+class Region;
+class Spec;
+class BundleIO;
+class ValueMap;
+class RegisteredRegionImpl;
 
-    // Create a RegionImpl of a specific type; caller gets ownership.
-    RegionImpl* createRegionImpl(const std::string nodeType,
-                                 const std::string nodeParams,
-                                 Region* region);
+class RegionImplFactory {
+public:
+  static RegionImplFactory &getInstance();
 
-    // Create a RegionImpl from serialized state; caller gets ownership.
-    RegionImpl* deserializeRegionImpl(const std::string nodeType,
-                                      BundleIO& bundle,
-                                      Region* region);
+  // RegionImplFactory is a lightweight object
+  ~RegionImplFactory(){};
 
-    // Create a RegionImpl from capnp proto; caller gets ownership.
-    RegionImpl* deserializeRegionImpl(const std::string nodeType,
-                                      capnp::AnyPointer::Reader& proto,
-                                      Region* region);
+  // Create a RegionImpl of a specific type; caller gets ownership.
+  RegionImpl *createRegionImpl(const std::string nodeType,
+                               const std::string nodeParams, Region *region);
 
-    // Returns nodespec for a specific node type; Factory retains ownership.
-    Spec* getSpec(const std::string nodeType);
+  // Create a RegionImpl from serialized state; caller gets ownership.
+  RegionImpl *deserializeRegionImpl(const std::string nodeType,
+                                    BundleIO &bundle, Region *region);
 
-    // RegionImplFactory caches nodespecs and the dynamic library reference
-    // This frees up the cached information.
-    // Should be called only if there are no outstanding
-    // nodespec references (e.g. in NuPIC shutdown) or pynodes.
-    void cleanup();
 
-    static void registerPyRegionPackage(const char * path);
+  // Returns node spec for a specific node type as a shared pointer.
+  std::shared_ptr<Spec>& getSpec(const std::string nodeType);
 
-    // Allows the user to load custom Python regions
-    static void registerPyRegion(const std::string module, const std::string className);
+  // RegionImplFactory caches nodespecs and the dynamic library reference
+  // This frees up the cached information.
+  // Should be called only if there are no outstanding
+  // nodespec references (e.g. in NuPIC shutdown) or pynodes.
+  // Used in unit tests to Setup for next test.
+  static void cleanup();
 
-    // Allows the user to load custom C++ regions
-    static void registerCPPRegion(const std::string name, GenericRegisteredRegionImpl * wrapper);
 
-    // Allows the user to unregister Python regions
-    static void unregisterPyRegion(const std::string className);
+  // Allows the user to load custom region types
+  static void registerRegion(const std::string& regionType,
+                             RegisteredRegionImpl *wrapper);
 
-    // Allows the user to unregister C++ regions
-    static void unregisterCPPRegion(const std::string name);
+  // Allows the user to unregister region types
+  static void unregisterRegion(const std::string regionType);
 
-  private:
-    RegionImplFactory() {};
-    RegionImplFactory(const RegionImplFactory &);
+private:
+  RegionImplFactory(){};
+  RegionImplFactory(const RegionImplFactory &);
 
-    // TODO: implement locking for thread safety for this global data structure
-    // TODO: implement cleanup
 
-    // getSpec returns references to nodespecs in this cache.
-    // should not be cleaned up until those references have disappeared.
-    std::map<std::string, Spec*> nodespecCache_;
+  // Mappings for region nodeTypes that map to Class and module
+  std::map<const std::string, std::shared_ptr<RegisteredRegionImpl> > regionTypeMap;
+  std::map<const std::string, std::shared_ptr<Spec> > regionSpecMap;
+  void addRegionType(const std::string nodeType, RegisteredRegionImpl* wrapper);
 
-    // Using shared_ptr here to ensure the dynamic python library object
-    // is deleted when the factory goes away. Can't use scoped_ptr
-    // because it is not initialized in the constructor.
-    boost::shared_ptr<DynamicPythonLibrary> pyLib_;
-  };
-}
+};
+} // namespace nupic
 
 #endif // NTA_REGION_IMPL_FACTORY_HPP

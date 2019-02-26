@@ -21,8 +21,8 @@
 
 # Utilities for manipulating libraries
 
-cmake_minimum_required(VERSION 2.8)
-project(nupic_core_library_utils CXX)
+cmake_minimum_required(VERSION 3.3)
+project(nupic_core CXX)
 
 
 # function MERGE_STATIC_LIBRARIES
@@ -51,19 +51,19 @@ function(MERGE_STATIC_LIBRARIES LIB_TARGET STATIC_LIBS)
   # add a post-build custom step that will add the objects from the given static
   # libraries
   add_library(${LIB_TARGET} STATIC ${dummy_source_file})
-  set_target_properties(${LIB_TARGET} PROPERTIES COMPILE_FLAGS
-                        ${INTERNAL_CXX_FLAGS_OPTIMIZED})
+  target_compile_options( ${LIB_TARGET} PUBLIC ${INTERNAL_CXX_FLAGS})
 
   set(static_lib_locations)
   set(dummy_dependencies)
   set(link_libs)
-
-  foreach(lib ${STATIC_LIBS})
+  set(ignore_lib)
+  foreach(lib ${STATIC_LIBS})    
     list(APPEND dummy_dependencies ${lib})
 
     if (NOT TARGET ${lib})
       # Assuming a path of an externally-generated static library
       list(APPEND static_lib_locations ${lib})
+      message(STATUS "MERGE_STATIC_LIBRARIES:     ${lib} - non-target lib.")
     else()
       # Assuming a cmake static library target
       get_target_property(lib_type ${lib} TYPE)
@@ -78,11 +78,9 @@ function(MERGE_STATIC_LIBRARIES LIB_TARGET STATIC_LIBS)
       get_target_property(link_iface ${lib} INTERFACE_LINK_LIBRARIES)
       if (link_iface)
         list(APPEND link_libs ${link_iface})
-        message(STATUS "MERGE_STATIC_LIBRARIES: "
-                "INTERFACE_LINK_LIBRARIES[${lib}] = ${link_iface}.")
+        message(STATUS "MERGE_STATIC_LIBRARIES:     ${lib} Link interface: ${link_iface}.")
       else()
-        message(STATUS "MERGE_STATIC_LIBRARIES: "
-                "Link interface not specified in source lib ${lib}.")
+        message(STATUS "MERGE_STATIC_LIBRARIES:     ${lib}")
       endif()
     endif()
   endforeach()
@@ -100,15 +98,18 @@ function(MERGE_STATIC_LIBRARIES LIB_TARGET STATIC_LIBS)
 
   # Merge the archives
   if(MSVC)
-    # pass source libs to lib.exe via STATIC_LIBRARY_FLAGS target property
-
-    set(msvc_library_flags "")
-    foreach(lib_location ${static_lib_locations})
-      set(msvc_library_flags "${msvc_library_flags} ${lib_location}")
-    endforeach()
-    set_target_properties(${LIB_TARGET} PROPERTIES STATIC_LIBRARY_FLAGS
-                          "${msvc_library_flags}")
-  else()
+    # pass source libs to lib.exe
+    # Basically it is equivalent to   Lib.exe /Out:lib lib1 lib2 lib3 ...
+    get_filename_component(lib_path "${CMAKE_LINKER}" DIRECTORY)
+    add_custom_command(
+      TARGET ${LIB_TARGET} POST_BUILD
+      COMMAND "${lib_path}/Lib.exe" ARGS  "/OUT:$<TARGET_FILE:${LIB_TARGET}>" ${static_lib_locations}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+      COMMAND_EXPAND_LISTS
+      VERBATIM
+      COMMENT "Combining $<TARGET_FILE:${LIB_TARGET}> for target ${LIB_TARGET} from ${static_lib_locations}."
+    )
+  else(MSVC)
     # UNIX OR MSYS OR MINGW: use post-build command to extract objects from
     # source libs and repack them for the target library
 
@@ -135,6 +136,6 @@ function(MERGE_STATIC_LIBRARIES LIB_TARGET STATIC_LIBS)
       COMMENT "Combining ${target_location_gen} for target ${LIB_TARGET} from ${static_lib_locations}."
     )
 
-  endif()
+  endif(MSVC)
 
 endfunction(MERGE_STATIC_LIBRARIES)

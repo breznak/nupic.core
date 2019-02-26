@@ -23,65 +23,92 @@
 /** @file
  * Implementation of Output class
  *
-*/
+ */
 
-#include <cstring> // memset
-#include <nupic/types/BasicType.hpp>
-#include <nupic/ntypes/Array.hpp>
+#include <nupic/engine/Link.hpp> 
 #include <nupic/engine/Output.hpp>
+#include <nupic/engine/Spec.hpp>
 #include <nupic/engine/Region.hpp>
-#include <nupic/engine/Link.hpp> // temporary
+#include <nupic/types/BasicType.hpp>
 
+namespace nupic {
 
-namespace nupic
-{
-
-Output::Output(Region& region, NTA_BasicType type, bool isRegionLevel) :
-  region_(region), isRegionLevel_(isRegionLevel), name_("Unnamed"), nodeOutputElementCount_(0)
-{
-  data_ = new Array(type);
+Output::Output(Region* region, const std::string& outputName, NTA_BasicType type)
+    : region_(region), 
+      name_(outputName) {
+  data_ = Array(type);
 }
 
-Output::~Output()
-{
+Output::~Output() noexcept(false) {
   // If we have any outgoing links, then there has been an
   // error in the shutdown process. Not good to thow an exception
   // from a destructor, but we need to catch this error, and it
   // should never occur if nupic internal logic is correct.
-  NTA_CHECK(links_.size() == 0) << "Internal error in region deletion";
-  delete data_;
+  NTA_CHECK(links_.size() == 0) << "Internal error in region deletion, still has links.";
 }
 
+
 // allocate buffer
-void
-Output::initialize(size_t count)
-{
+void Output::initialize() {
   // reinitialization is ok
   // might happen if initial initialization failed with an
   // exception (elsewhere) and was retried.
-  if (data_->getBuffer() != nullptr)
+  if (data_.has_buffer())
     return;
 
-  nodeOutputElementCount_ = count;
-  size_t dataCount;
-  if (isRegionLevel_)
-    dataCount = count;
-  else
-    dataCount = count * region_.getDimensions().getCount();
-  if (dataCount != 0)
-  {
-    data_->allocateBuffer(dataCount);
+
+  NTA_CHECK(!dim_.isDontcare())
+        << "Output Dimensions cannot be determined for Region "
+        << region_->getName() << "; output " << name_;
+
+  size_t count = dim_.getCount();
+  if (data_.getType() == NTA_BasicType_SDR) {
+      data_.allocateBuffer(dim_);
+  } else {
+    data_.allocateBuffer(count);
     // Zero the buffer because unitialized outputs can screw up inspectors,
     // which look at the output before compute(). NPC-60
-    void *buffer = data_->getBuffer();
-    size_t byteCount = dataCount * BasicType::getSize(data_->getType());
-    memset(buffer, 0, byteCount);
+    data_.zeroBuffer();
   }
 }
 
-void
-Output::addLink(Link* link)
-{
+
+Dimensions Output::determineDimensions() {
+  if (data_.has_buffer())
+    return dim_;
+
+  const std::shared_ptr<Spec>& srcSpec = region_->getSpec();
+
+  if (!dim_.isSpecified()) {
+    dim_.clear();
+    // ask the spec how big the buffer is.
+    UInt32 count = (UInt32)srcSpec->outputs.getByName(name_).count; 
+    if (count > 0) {
+      dim_.push_back(count);
+    } else {
+      // ask the region impl what the output dimensions are.
+      dim_ = region_->askImplForOutputDimensions(name_);
+      if (dim_.isUnspecified()) {
+        dim_.push_back(0);  // set Don't care.
+      }
+    }
+  }
+  // If we still have a isDontcare, check if the spec defines 
+  // regionLevel then get the dimensions from the region dims. 
+  bool regionLevel = srcSpec->outputs.getByName(name_).regionLevel;
+  if (regionLevel) {
+    Dimensions d = region_->getDimensions();
+    if (dim_.isDontcare()&& d.isSpecified()) {
+      dim_ = d;
+    }
+    else if (dim_.isSpecified() && d.isDontcare()) {
+      region_->setDimensions(dim_);
+    }
+  }
+  return dim_;
+}
+
+void Output::addLink(std::shared_ptr<Link> link) {
   // Make sure we don't add the same link twice
   // It is a logic error if we add the same link twice here, since
   // this method should only be called from Input::addLink
@@ -91,9 +118,7 @@ Output::addLink(Link* link)
   links_.insert(link);
 }
 
-void
-Output::removeLink(Link* link)
-{
+void Output::removeLink(std::shared_ptr<Link> link) {
   auto linkIter = links_.find(link);
   // Should only be called internally. Logic error if link not found
   NTA_CHECK(linkIter != links_.end());
@@ -102,48 +127,19 @@ Output::removeLink(Link* link)
   links_.erase(linkIter);
 }
 
-const Array &
-Output::getData() const
-{
-  return *data_;
+
+Region* Output::getRegion() const { return region_; }
+
+void Output::setName(const std::string &name) { name_ = name; }
+
+const std::string &Output::getName() const { return name_; }
+
+size_t Output::getNodeOutputElementCount() const {
+  return dim_.getCount();
 }
 
-bool
-Output::isRegionLevel() const
-{
-  return isRegionLevel_;
-}
+bool Output::hasOutgoingLinks() { return (!links_.empty()); }
 
+NTA_BasicType Output::getDataType() const { return data_.getType(); }
 
-Region&
-Output::getRegion() const
-{
-  return region_;
-}
-
-
-void Output::setName(const std::string& name)
-{
-  name_ = name;
-}
-
-const std::string& Output::getName() const
-{
-  return  name_;
-}
-
-
-size_t
-Output::getNodeOutputElementCount() const
-{
-  return nodeOutputElementCount_;
-}
-
-bool
-Output::hasOutgoingLinks()
-{
-  return (!links_.empty());
-}
-
-}
-
+} // namespace nupic

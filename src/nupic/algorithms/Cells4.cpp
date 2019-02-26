@@ -20,30 +20,21 @@
  * ---------------------------------------------------------------------
  */
 
+#include <algorithm>
+#include <iostream>
+#include <limits> // numeric_limits
+#include <set>
+#include <vector>
+
+#include <nupic/algorithms/Cells4.hpp>
+
+#include <nupic/algorithms/SegmentUpdate.hpp>
+#include <nupic/math/StlIo.hpp>     // binary_save
+#include <nupic/os/Timer.hpp>
+#include <nupic/utils/Log.hpp>
 #include <nupic/utils/Random.hpp>
 
-#include <algorithm>
-#include <iomanip>
-#include <vector>
-#include <iostream>
-#include <limits>  // numeric_limits
-#include <set>
-#include <sstream>
-
-#include "cycle_counter.hpp"
-#include <nupic/utils/Log.hpp>
-#include <assert.h>
-#include <cstring>
-#include <map>
-#include <nupic/math/ArrayAlgo.hpp> // is_in
-#include <nupic/math/StlIo.hpp> // binary_save
-#include <nupic/algorithms/Cells4.hpp>
-#include <nupic/algorithms/SegmentUpdate.hpp>
-#include <nupic/algorithms/Cell.hpp>
-#include <nupic/os/FStream.hpp>
-
-#include <nupic/os/Timer.hpp>
-
+using namespace nupic;
 using namespace nupic::algorithms::Cells4;
 
 // Comment or uncomment to turn on timing
@@ -82,9 +73,18 @@ Cells4::Cells4(UInt nColumns, UInt nCellsPerCol,
                      int seed,
                      bool initFromCpp,
                      bool checkSynapseConsistency)
-  : _rng(seed < 0 ? rand() : seed)
+  : _rng(seed < 0 ? 0/*rand*/ : seed)
 {
   _version = VERSION;
+  _ownsMemory = true;
+  _cellConfidenceT  = nullptr;
+  _cellConfidenceT1 = nullptr;
+  _colConfidenceT   = nullptr;
+  _colConfidenceT1  = nullptr;
+  _cellConfidenceCandidate  = nullptr;
+  _colConfidenceCandidate  = nullptr;
+  _tmpInputBuffer  = nullptr;
+
   initialize(nColumns,
              nCellsPerCol,
              activationThreshold,
@@ -102,49 +102,46 @@ Cells4::Cells4(UInt nColumns, UInt nCellsPerCol,
              checkSynapseConsistency);
 }
 
-Cells4::~Cells4()
-{
+Cells4::~Cells4() {
   if (_ownsMemory) {
-    delete [] _cellConfidenceT;
-    delete [] _cellConfidenceT1;
-    delete [] _colConfidenceT;
-    delete [] _colConfidenceT1;
+    if (_cellConfidenceT)       delete[] _cellConfidenceT;
+    if (_cellConfidenceT1)      delete[] _cellConfidenceT1;
+    if (_colConfidenceT)        delete[] _colConfidenceT;
+    if (_colConfidenceT1)       delete[] _colConfidenceT1;
   }
-  delete [] _cellConfidenceCandidate;
-  delete [] _colConfidenceCandidate;
-  delete [] _tmpInputBuffer;
+  if (_cellConfidenceCandidate) delete[] _cellConfidenceCandidate;
+  if (_colConfidenceCandidate)  delete[] _colConfidenceCandidate;
+  if (_tmpInputBuffer)          delete[] _tmpInputBuffer;
 }
 
 //--------------------------------------------------------------------------------
-// Utility routines used in this file to print list of active columns and cell indices
+// Utility routines used in this file to print list of active columns and cell
+// indices
 //--------------------------------------------------------------------------------
-static void printActiveColumns(std::ostream& out, const std::vector<UInt> & activeColumns)
-{
+static void printActiveColumns(std::ostream &out,
+                               const std::vector<UInt> &activeColumns) {
   out << "[";
-  for (auto & activeColumn : activeColumns) {
+  for (auto &activeColumn : activeColumns) {
     out << " " << activeColumn;
   }
   out << "]";
 }
 
-static void printCell(UInt srcCellIdx, UInt nCellsPerCol)
-{
-  UInt col =  (UInt) (srcCellIdx / nCellsPerCol);
-  UInt cell = srcCellIdx - col*nCellsPerCol;
+static void printCell(UInt srcCellIdx, UInt nCellsPerCol) {
+  NTA_ASSERT(nCellsPerCol != 0) << "cannot be 0, division by zero!";
+  UInt col = (UInt)(srcCellIdx / nCellsPerCol);
+  UInt cell = srcCellIdx - col * nCellsPerCol;
   std::cout << "[" << col << "," << cell << "]  ";
 }
 
-
-
 //--------------------------------------------------------------------------------
-bool Cells4::isActive(UInt cellIdx, UInt segIdx, const CState& state) const
-{
+bool Cells4::isActive(UInt cellIdx, UInt segIdx, const CState &state) const {
   {
     NTA_ASSERT(cellIdx < nCells());
     NTA_ASSERT(segIdx < _cells[cellIdx].size());
   }
 
-  const Segment& seg = _cells[cellIdx][segIdx];
+  const Segment &seg = _cells[cellIdx][segIdx];
 
   if (seg.size() < _activationThreshold)
     return false;
@@ -155,8 +152,8 @@ bool Cells4::isActive(UInt cellIdx, UInt segIdx, const CState& state) const
 //--------------------------------------------------------------------------------
 /**
  * Push a segmentUpdate data structure containing a list of proposed changes
- * to segment s into our SegmentUpdate list. Return false if no update was actually
- * pushed (this can happen if we didn't find any new synapses).
+ * to segment s into our SegmentUpdate list. Return false if no update was
+ * actually pushed (this can happen if we didn't find any new synapses).
  *
  * Let activeSynapses be the list of active synapses where the
  * originating cells have their activeState output = 1 at time step t.
@@ -169,28 +166,27 @@ bool Cells4::isActive(UInt cellIdx, UInt segIdx, const CState& state) const
  * NOTE: called getSegmentActiveSynapses in Python
  *
  */
-bool Cells4::computeUpdate(UInt cellIdx, UInt segIdx, CStateIndexed& activeState,
-                          bool sequenceSegmentFlag, bool newSynapsesFlag)
-{
+bool Cells4::computeUpdate(UInt cellIdx, UInt segIdx,
+                           CStateIndexed &activeState, bool sequenceSegmentFlag,
+                           bool newSynapsesFlag) {
   {
     NTA_ASSERT(cellIdx < nCells());
-    NTA_ASSERT(segIdx == (UInt) - 1 || segIdx < _cells[cellIdx].size());
+    NTA_ASSERT(segIdx == (UInt)-1 || segIdx < _cells[cellIdx].size());
   }
 
   static std::vector<UInt> newSynapses;
-  newSynapses.clear();                 // purge residual data
+  newSynapses.clear(); // purge residual data
 
-  if (segIdx != (UInt) -1) { // not a new segment
+  if (segIdx != (UInt)-1) { // not a new segment
 
-    Segment& segment = _cells[cellIdx][segIdx];
+    Segment &segment = _cells[cellIdx][segIdx];
 
     static UInt highWaterSize = 0;
     if (highWaterSize < segment.size()) {
-      highWaterSize = segment.size();
+      highWaterSize = (UInt)segment.size();
       newSynapses.reserve(highWaterSize);
     }
-    for (UInt i = 0; i < segment.size(); ++i)
-    {
+    for (UInt i = 0; i < segment.size(); ++i) {
       if (activeState.isSet(segment[i].srcCellIdx())) {
         newSynapses.push_back(segment[i].srcCellIdx());
       }
@@ -198,9 +194,10 @@ bool Cells4::computeUpdate(UInt cellIdx, UInt segIdx, CStateIndexed& activeState
   }
 
   if (newSynapsesFlag) {
-    int nSynToAdd = (int) _newSynapseCount - (int) newSynapses.size();
+    int nSynToAdd = (int)_newSynapseCount - (int)newSynapses.size();
     if (nSynToAdd > 0) {
-      chooseCellsToLearnFrom(cellIdx, segIdx, nSynToAdd, activeState, newSynapses);
+      chooseCellsToLearnFrom(cellIdx, segIdx, nSynToAdd, activeState,
+                             newSynapses);
     }
   }
 
@@ -209,8 +206,8 @@ bool Cells4::computeUpdate(UInt cellIdx, UInt segIdx, CStateIndexed& activeState
   if (newSynapses.empty())
     return false;
 
-  SegmentUpdate update(cellIdx, segIdx, sequenceSegmentFlag,
-                       _nLrnIterations, newSynapses); // TODO: Add this for invariants check
+  SegmentUpdate update(cellIdx, segIdx, sequenceSegmentFlag, _nLrnIterations,
+                       newSynapses); // TODO: Add this for invariants check
 
   _segmentUpdates.push_back(update);
   return true;
@@ -237,42 +234,41 @@ void Cells4::addOutSynapses(UInt dstCellIdx, UInt dstSegIdx,
   NTA_ASSERT(dstSegIdx < _cells[dstCellIdx].size());
 
   for (; newSynapse != newSynapsesEnd; ++newSynapse) {
-    UInt srcCellIdx = *newSynapse;
-    OutSynapse newOutSyn(dstCellIdx, dstSegIdx);
-    NTA_ASSERT(not_in(newOutSyn, _outSynapses[srcCellIdx]));
+    const UInt srcCellIdx = *newSynapse;
+    const OutSynapse newOutSyn(dstCellIdx, dstSegIdx);
+    const auto out = _outSynapses[srcCellIdx]; 
+
+    NTA_ASSERT(std::find(out.cbegin(), out.cend(), newOutSyn) == out.cend()); //newOutSyn is not in "out"
     _outSynapses[srcCellIdx].push_back(newOutSyn);
   }
-
 }
 
 // explicit instantiations for the method above
 namespace nupic {
-  namespace algorithms {
-    namespace Cells4 {
-      template void Cells4::addOutSynapses(nupic::UInt, nupic::UInt,
-                       std::set<nupic::UInt>::const_iterator,
-                       std::set<nupic::UInt>::const_iterator);
-      template void Cells4::addOutSynapses(nupic::UInt, nupic::UInt,
-                       std::vector<nupic::UInt>::const_iterator,
-                       std::vector<nupic::UInt>::const_iterator);
+namespace algorithms {
+namespace Cells4 {
+template void Cells4::addOutSynapses(nupic::UInt, nupic::UInt,
+                                     std::set<nupic::UInt>::const_iterator,
+                                     std::set<nupic::UInt>::const_iterator);
+template void Cells4::addOutSynapses(nupic::UInt, nupic::UInt,
+                                     std::vector<nupic::UInt>::const_iterator,
+                                     std::vector<nupic::UInt>::const_iterator);
 
-    }
-  }
-}
-
+} // namespace Cells4
+} // namespace algorithms
+} // namespace nupic
 
 //--------------------------------------------------------------------------------
 /**
  * Erases an OutSynapses. See addOutSynapses just above.
  */
 void Cells4::eraseOutSynapses(UInt dstCellIdx, UInt dstSegIdx,
-                  const std::vector<UInt>& srcCells)
-{
+                              const std::vector<UInt> &srcCells) {
   NTA_ASSERT(dstCellIdx < nCells());
   NTA_ASSERT(dstSegIdx < _cells[dstCellIdx].size());
 
-  for (auto & srcCellIdx : srcCells) {
-    OutSynapses& outSyns = _outSynapses[srcCellIdx];
+  for (auto &srcCellIdx : srcCells) {
+    OutSynapses &outSyns = _outSynapses[srcCellIdx];
     // TODO: binary search or faster
     for (UInt j = 0; j != outSyns.size(); ++j)
       if (outSyns[j].goesTo(dstCellIdx, dstSegIdx)) {
@@ -289,8 +285,7 @@ void Cells4::eraseOutSynapses(UInt dstCellIdx, UInt dstSegIdx,
  * onto the current set of inputs by assuming the sequence started N
  * steps ago on start cells.
  */
-void Cells4::inferBacktrack(const std::vector<UInt> & activeColumns)
-{
+void Cells4::inferBacktrack(const std::vector<UInt> &activeColumns) {
   //---------------------------------------------------------------------------
   // How much input history have we accumulated? Is it enough to backtrack?
   // The current input is always at the end of self._prevInfPatterns, but
@@ -300,7 +295,7 @@ void Cells4::inferBacktrack(const std::vector<UInt> & activeColumns)
   TIMER(infBacktrackTimer.start());
 
   // This is an easy to use label for the current time step
-  UInt currentTimeStepsOffset = _prevInfPatterns.size() - 1;
+  UInt currentTimeStepsOffset = (UInt)_prevInfPatterns.size() - 1;
 
   //---------------------------------------------------------------------------
   // Save our current active state in case we fail to find a place to restart
@@ -314,7 +309,7 @@ void Cells4::inferBacktrack(const std::vector<UInt> & activeColumns)
   // input history queue so that we don't waste time evaluating them again at
   // a later time step.
   static std::vector<UInt> badPatterns;
-  badPatterns.clear();                      // purge residual data
+  badPatterns.clear(); // purge residual data
 
   //---------------------------------------------------------------------------
   // Let's go back in time and replay the recent inputs from start cells and
@@ -328,8 +323,7 @@ void Cells4::inferBacktrack(const std::vector<UInt> & activeColumns)
 
     // If we have a candidate already in the past, don't bother falling back
     // to start cells on the current input.
-    if ( (startOffset == currentTimeStepsOffset) &&
-         (candConfidence != -1) )
+    if ((startOffset == currentTimeStepsOffset) && (candConfidence != -1))
       break;
 
     if (_verbosity >= 3) {
@@ -342,14 +336,14 @@ void Cells4::inferBacktrack(const std::vector<UInt> & activeColumns)
     // Play through starting from time t-startOffset
     inSequence = false;
     Real totalConfidence = 0;
-    for (UInt offset = startOffset; offset < _prevInfPatterns.size(); offset++)
-    {
+    for (UInt offset = startOffset; offset < _prevInfPatterns.size();
+         offset++) {
       // If we are about to set the active columns for the current time step
       // based on what we predicted, capture and save the total confidence of
       // predicting the current input
       if (offset == currentTimeStepsOffset) {
         totalConfidence = 0;
-        for (auto & activeColumn : activeColumns) {
+        for (auto &activeColumn : activeColumns) {
           totalConfidence += _colConfidenceT[activeColumn];
         }
       }
@@ -365,37 +359,37 @@ void Cells4::inferBacktrack(const std::vector<UInt> & activeColumns)
         std::cout << "  backtrack: computing predictions from ";
         printActiveColumns(std::cout, _prevInfPatterns[offset]);
         std::cout << "\n";
-
       }
       inSequence = inferPhase2();
-      if (!inSequence) break;
+      if (!inSequence)
+        break;
     }
 
     // If starting from startOffset got lost along the way, mark it as an
     // invalid start point.
     if (!inSequence) {
       badPatterns.push_back(startOffset);
-    }
-    else {
+    } else {
       candStartOffset = startOffset;
 
       // If we got to here, startOffset is a candidate starting point.
-      if (_verbosity >= 3 && (startOffset != currentTimeStepsOffset) ) {
+      if (_verbosity >= 3 && (startOffset != currentTimeStepsOffset)) {
         std::cout << "# Prediction confidence of current input after starting "
-        << _prevInfPatterns.size() - 1 - startOffset
-        << " steps ago: " << totalConfidence << "\n";
+                  << _prevInfPatterns.size() - 1 - startOffset
+                  << " steps ago: " << totalConfidence << "\n";
       }
 
-      if (candStartOffset == (Int) currentTimeStepsOffset)
+      if (candStartOffset == (Int)currentTimeStepsOffset)
         break;
       _infActiveStateCandidate = _infActiveStateT;
       _infPredictedStateCandidate = _infPredictedStateT;
-      memcpy(_cellConfidenceCandidate, _cellConfidenceT, _nCells * sizeof(_cellConfidenceT[0]));
-      memcpy(_colConfidenceCandidate, _colConfidenceT, _nColumns * sizeof(_colConfidenceT[0]));
+      memcpy(_cellConfidenceCandidate, _cellConfidenceT,
+             _nCells * sizeof(_cellConfidenceT[0]));
+      memcpy(_colConfidenceCandidate, _colConfidenceT,
+             _nColumns * sizeof(_colConfidenceT[0]));
 
       break;
     }
-
   }
 
   //---------------------------------------------------------------------------
@@ -411,37 +405,36 @@ void Cells4::inferBacktrack(const std::vector<UInt> & activeColumns)
   } else {
     if (_verbosity >= 3) {
       std::cout << "Locked on to current input by using start cells from "
-                << _prevInfPatterns.size() - 1 - candStartOffset <<
-                " steps ago.\n";
+                << _prevInfPatterns.size() - 1 - candStartOffset
+                << " steps ago.\n";
     }
     // Install the candidate state, if it wasn't the last one we evaluated.
-    if (candStartOffset != (Int) currentTimeStepsOffset) {
+    if (candStartOffset != (Int)currentTimeStepsOffset) {
       _infActiveStateT = _infActiveStateCandidate;
       _infPredictedStateT = _infPredictedStateCandidate;
-      memcpy(_cellConfidenceT, _cellConfidenceCandidate, _nCells * sizeof(_cellConfidenceCandidate[0]));
-      memcpy(_colConfidenceT, _colConfidenceCandidate, _nColumns * sizeof(_colConfidenceCandidate[0]));
+      memcpy(_cellConfidenceT, _cellConfidenceCandidate,
+             _nCells * sizeof(_cellConfidenceCandidate[0]));
+      memcpy(_colConfidenceT, _colConfidenceCandidate,
+             _nColumns * sizeof(_colConfidenceCandidate[0]));
     }
   }
 
   //---------------------------------------------------------------------------
   // Remove any useless patterns at the head of the previous input pattern
   // queue.
-  UInt numPrevPatterns = _prevInfPatterns.size();
-  for (UInt i = 0; i < numPrevPatterns; i++)
-  {
+  UInt numPrevPatterns = (UInt)_prevInfPatterns.size();
+  for (UInt i = 0; i < numPrevPatterns; i++) {
     std::vector<UInt>::iterator result;
     result = find(badPatterns.begin(), badPatterns.end(), i);
-    if ( result != badPatterns.end() ||
-         ( (candStartOffset != -1) && ((Int)i <= candStartOffset) ) )
-    {
+    if (result != badPatterns.end() ||
+        ((candStartOffset != -1) && ((Int)i <= candStartOffset))) {
       if (_verbosity >= 3) {
         std::cout << "Removing useless pattern from history ";
         printActiveColumns(std::cout, _prevInfPatterns[0]);
         std::cout << "\n";
       }
       _prevInfPatterns.pop_front();
-    }
-    else
+    } else
       break;
   }
 
@@ -457,14 +450,13 @@ void Cells4::inferBacktrack(const std::vector<UInt> & activeColumns)
  * A utility method called from learnBacktrack. This will backtrack
  * starting from the given startOffset in our prevLrnPatterns queue.
  */
-bool Cells4::learnBacktrackFrom(UInt startOffset, bool readOnly)
-{
+bool Cells4::learnBacktrackFrom(UInt startOffset, bool readOnly) {
   // How much input history have we accumulated?
   // The current input is always at the end of self._prevInfPatterns (at
   // index -1), but it is also evaluated as a potential starting point by
   // turning on it's start cells and seeing if it generates sufficient
   // predictions going forward.
-  UInt numPrevPatterns = _prevLrnPatterns.size();
+  UInt numPrevPatterns = (UInt)_prevLrnPatterns.size();
 
   // This is an easy to use label for the current time step
   NTA_CHECK(numPrevPatterns >= 2);
@@ -491,8 +483,7 @@ bool Cells4::learnBacktrackFrom(UInt startOffset, bool readOnly)
   //---------------------------------------------------------------------------
   // Play through up to the current time step
   bool inSequence = true;
-  for (UInt offset = startOffset; offset < numPrevPatterns; offset++)
-  {
+  for (UInt offset = startOffset; offset < numPrevPatterns; offset++) {
 
     //--------------------------------------------------------------------------
     // Copy predicted and active states into t-1
@@ -502,7 +493,7 @@ bool Cells4::learnBacktrackFrom(UInt startOffset, bool readOnly)
     // Apply segment updates from the last set of predictions
     if (!readOnly) {
       memset(_tmpInputBuffer, 0, _nColumns * sizeof(_tmpInputBuffer[0]));
-      for (auto & elem : _prevLrnPatterns[offset]) {
+      for (auto &elem : _prevLrnPatterns[offset]) {
         _tmpInputBuffer[elem] = 1;
       }
       processSegmentUpdates(_tmpInputBuffer, _learnPredictedStateT);
@@ -512,8 +503,8 @@ bool Cells4::learnBacktrackFrom(UInt startOffset, bool readOnly)
     // Compute activeState[t] given bottom-up and predictedState[t-1]
     if (offset == startOffset) {
       _learnActiveStateT.resetAll();
-      for (auto & elem : _prevLrnPatterns[offset]) {
-        UInt cellIdx = elem*_nCellsPerCol;
+      for (auto &elem : _prevLrnPatterns[offset]) {
+        UInt cellIdx = elem * _nCellsPerCol;
         _learnActiveStateT.set(cellIdx);
         inSequence = true;
       }
@@ -523,7 +514,7 @@ bool Cells4::learnBacktrackFrom(UInt startOffset, bool readOnly)
 
     // Break out immediately if we fell out of sequence or reached the current
     // time step
-    if (!inSequence || (offset == currentTimeStepsOffset) )
+    if (!inSequence || (offset == currentTimeStepsOffset))
       break;
 
     //--------------------------------------------------------------------------
@@ -551,12 +542,12 @@ bool Cells4::learnBacktrackFrom(UInt startOffset, bool readOnly)
  * onto the current set of inputs by assuming the sequence started
  * up to N steps ago on start cells.
  */
-UInt Cells4::learnBacktrack()
-{
+UInt Cells4::learnBacktrack() {
   // How much input history have we accumulated?
   // The current input is always at the end of self._prevInfPatterns (at
   // index -1), and is not a valid startingOffset to evaluate.
-  UInt numPrevPatterns = (_prevLrnPatterns.size() == 0 ? 0 : _prevLrnPatterns.size() - 1);
+  UInt numPrevPatterns =
+      (UInt)(_prevLrnPatterns.size() == 0 ? 0 : _prevLrnPatterns.size() - 1);
   if (numPrevPatterns <= 0) {
     if (_verbosity >= 3) {
       std::cout << "lrnBacktrack: No available history to backtrack from\n";
@@ -569,7 +560,7 @@ UInt Cells4::learnBacktrack()
   // input history queue so that we don't waste time evaluating them again at
   // a later time step.
   static std::vector<UInt> badPatterns;
-  badPatterns.clear();                      // purge residual data
+  badPatterns.clear(); // purge residual data
 
   //---------------------------------------------------------------------------
   // Let's go back in time and replay the recent inputs from start cells and
@@ -617,25 +608,21 @@ UInt Cells4::learnBacktrack()
 
   // Remove any useless patterns at the head of the input pattern history
   // queue
-  for (UInt i = 0; i < (UInt) numPrevPatterns; i++)
-  {
+  for (UInt i = 0; i < (UInt)numPrevPatterns; i++) {
     std::vector<UInt>::iterator result;
     result = find(badPatterns.begin(), badPatterns.end(), i);
-    if ( result != badPatterns.end() || (i <= startOffset) )
-    {
+    if (result != badPatterns.end() || (i <= startOffset)) {
       if (_verbosity >= 3) {
         std::cout << "Removing useless pattern from history ";
         printActiveColumns(std::cout, _prevLrnPatterns[0]);
         std::cout << "\n";
       }
       _prevLrnPatterns.pop_front();
-    }
-    else
+    } else
       break;
   }
 
   return numPrevPatterns - startOffset;
-
 }
 
 //----------------------------------------------------------------------
@@ -643,8 +630,7 @@ UInt Cells4::learnBacktrack()
  * Return the index of a cell in this column which is a good candidate
  * for adding a new segment.
  */
-UInt Cells4::getCellForNewSegment(UInt colIdx)
-{
+UInt Cells4::getCellForNewSegment(UInt colIdx) {
   TIMER(getNewCellTimer.start());
   UInt candidateCellIdx = 0;
 
@@ -652,13 +638,12 @@ UInt Cells4::getCellForNewSegment(UInt colIdx)
   if (_maxSegmentsPerCell < 0) {
     if (_nCellsPerCol > 1) {
       // Don't ever choose the start cell (cell # 0) in each column
-      candidateCellIdx = _rng.getUInt32(_nCellsPerCol-1) + 1;
-    }
-    else {
+      candidateCellIdx = _rng.getUInt32(_nCellsPerCol - 1) + 1;
+    } else {
       candidateCellIdx = 0;
     }
     TIMER(getNewCellTimer.stop());
-    return getCellIdx(colIdx,candidateCellIdx);
+    return getCellIdx(colIdx, candidateCellIdx);
   }
 
   // ---------------------------------------------------------------------
@@ -671,28 +656,26 @@ UInt Cells4::getCellForNewSegment(UInt colIdx)
   //  cell indices we choose in each column of a pattern will advance in
   //  lockstep (i.e. we pick cell indices of 1, then cell indices of 2, etc.).
   static std::vector<UInt> candidateCellIdxs;
-  candidateCellIdxs.clear();                // purge residual data
-  UInt minIdx = getCellIdx(colIdx,0), maxIdx = getCellIdx(colIdx,0);
+  candidateCellIdxs.clear(); // purge residual data
+  UInt minIdx = getCellIdx(colIdx, 0), maxIdx = getCellIdx(colIdx, 0);
   if (_nCellsPerCol > 0) {
-    minIdx = getCellIdx(colIdx,1);        // Don't include startCell in the mix
-    maxIdx = getCellIdx(colIdx,_nCellsPerCol - 1);
+    minIdx = getCellIdx(colIdx, 1); // Don't include startCell in the mix
+    maxIdx = getCellIdx(colIdx, _nCellsPerCol - 1);
   }
-  for (UInt i = minIdx; i <= maxIdx; i++)
-  {
-    Int numSegs = (Int) _cells[i].size();
+  for (UInt i = minIdx; i <= maxIdx; i++) {
+    Int numSegs = (Int)_cells[i].size();
     if (numSegs < _maxSegmentsPerCell) {
       candidateCellIdxs.push_back(i);
     }
   }
 
   // If we found one, return with it
-  if (!candidateCellIdxs.empty())
-  {
+  if (!candidateCellIdxs.empty()) {
     candidateCellIdx =
-                candidateCellIdxs[_rng.getUInt32(candidateCellIdxs.size())];
+        candidateCellIdxs[_rng.getUInt32((UInt)candidateCellIdxs.size())];
     if (_verbosity >= 5) {
-      std::cout << "Cell [" << colIdx
-                << "," << candidateCellIdx - getCellIdx(colIdx,0)
+      std::cout << "Cell [" << colIdx << ","
+                << candidateCellIdx - getCellIdx(colIdx, 0)
                 << "] chosen for new segment, # of segs is "
                 << _cells[candidateCellIdx].size() << "\n";
     }
@@ -704,14 +687,12 @@ UInt Cells4::getCellForNewSegment(UInt colIdx)
   // All cells in the column are full, find a segment with lowest duty
   // cycle to free up
 
-  UInt candidateSegmentIdx = (UInt) -1;
+  UInt candidateSegmentIdx = (UInt)-1;
   Real candidateSegmentDC = 1.0;
   // For each cell in this column
-  for (UInt i = minIdx; i <= maxIdx; i++)
-  {
+  for (UInt i = minIdx; i <= maxIdx; i++) {
     // For each non-empty segment in this cell
-    for (UInt segIdx= 0; segIdx < _cells[i].size(); segIdx++)
-    {
+    for (UInt segIdx = 0; segIdx < _cells[i].size(); segIdx++) {
       if (!_cells[i][segIdx].empty()) {
         Real dc = _cells[i][segIdx].dutyCycle(_nLrnIterations, false, false);
         if (dc < candidateSegmentDC) {
@@ -726,18 +707,16 @@ UInt Cells4::getCellForNewSegment(UInt colIdx)
   // Free up the least used segment
   if (_verbosity >= 5) {
     std::cout << "Deleting segment #" << candidateSegmentIdx << " for cell["
-              << colIdx << "," << candidateCellIdx - getCellIdx(colIdx,0)
+              << colIdx << "," << candidateCellIdx - getCellIdx(colIdx, 0)
               << "] to make room for new segment ";
     _cells[candidateCellIdx][candidateSegmentIdx].print(std::cout,
-                                                       _nCellsPerCol);
+                                                        _nCellsPerCol);
     std::cout << "\n";
-
   }
 
   // Remove this segment from cell and remove any pending updates to this
   // segment. Update outSynapses structure.
   std::vector<UInt> synsToRemove;
-  synsToRemove.clear();                     // purge residual data
   _cells[candidateCellIdx][candidateSegmentIdx].getSrcCellIndices(synsToRemove);
   eraseOutSynapses(candidateCellIdx, candidateSegmentIdx, synsToRemove);
   cleanUpdatesList(candidateCellIdx, candidateSegmentIdx);
@@ -761,13 +740,13 @@ bool Cells4::learnPhase1(const std::vector<UInt> & activeColumns, bool readOnly)
   _learnActiveStateT.resetAll();
 
   UInt numUnpredictedColumns = 0;
-  for (auto & activeColumn : activeColumns) {
-    UInt cell0 = activeColumn*_nCellsPerCol;
+  for (auto &activeColumn : activeColumns) {
+    UInt cell0 = activeColumn * _nCellsPerCol;
 
     // Find any predicting cell in this column (there is at most one)
     UInt numPredictedCells = 0, predictingCell = _nCellsPerCol;
-    for (UInt j= 0; j < _nCellsPerCol; j++) {
-      if (_learnPredictedStateT1.isSet(j+cell0)) {
+    for (UInt j = 0; j < _nCellsPerCol; j++) {
+      if (_learnPredictedStateT1.isSet(j + cell0)) {
         numPredictedCells++;
         predictingCell = j;
       }
@@ -779,36 +758,33 @@ bool Cells4::learnPhase1(const std::vector<UInt> & activeColumns, bool readOnly)
     if (numPredictedCells == 1) {
       NTA_ASSERT(predictingCell < _nCellsPerCol);
       _learnActiveStateT.set(cell0 + predictingCell);
-    }
-    else {
+    } else {
       //----------------------------------------------------------------------
       // If no predicted cell, pick the closest matching one to reinforce, or
       // if none exists, create a new segment on a cell in that column
       numUnpredictedColumns++;
-      if (! readOnly)
-      {
+      if (!readOnly) {
         std::pair<UInt, UInt> p;
         p = getBestMatchingCellT1(activeColumn, _learnActiveStateT1, _minThreshold);
         UInt cellIdx = p.first, segIdx = p.second;
 
         // If we found a sequence segment, reinforce it
-        if (segIdx != (UInt) -1 &&
-            _cells[cellIdx][segIdx].isSequenceSegment()) {
+        if (segIdx != (UInt)-1 && _cells[cellIdx][segIdx].isSequenceSegment()) {
 
           if (_verbosity >= 4) {
             std::cout << "Learn branch 0, found segment match: ";
             std::cout << "   learning on col=" << activeColumn
-            << ", cellIdx=" << cellIdx << "\n";
+                      << ", cellIdx=" << cellIdx << "\n";
           }
           _learnActiveStateT.set(cellIdx);
-          bool newUpdate = computeUpdate(cellIdx, segIdx,
-                                         _learnActiveStateT1, true, true);
+          bool newUpdate =
+              computeUpdate(cellIdx, segIdx, _learnActiveStateT1, true, true);
           _cells[cellIdx][segIdx]._totalActivations++;
 
           if (newUpdate) {
             // This will update the permanences,  posActivationsCount, and the
             // lastActiveIteration (age).
-            const SegmentUpdate& update = _segmentUpdates.back();
+            const SegmentUpdate &update = _segmentUpdates.back();
             adaptSegment(update);
             _segmentUpdates.pop_back();
           }
@@ -826,13 +802,13 @@ bool Cells4::learnPhase1(const std::vector<UInt> & activeColumns, bool readOnly)
                       << "\n";
           }
           _learnActiveStateT.set(newCellIdx);
-          bool newUpdate = computeUpdate(newCellIdx, (UInt) -1,
+          bool newUpdate = computeUpdate(newCellIdx, (UInt)-1,
                                          _learnActiveStateT1, true, true);
 
           // This will update the permanences,  posActivationsCount, and the
           // lastActiveIteration (age).
           if (newUpdate) {
-            const SegmentUpdate& update = _segmentUpdates.back();
+            const SegmentUpdate &update = _segmentUpdates.back();
             adaptSegment(update);
             _segmentUpdates.pop_back();
           }
@@ -847,15 +823,14 @@ bool Cells4::learnPhase1(const std::vector<UInt> & activeColumns, bool readOnly)
   //----------------------------------------------------------------------
   // Determine if we are out of sequence or not and reset our PAM counter
   // if we are in sequence
-  return numUnpredictedColumns < activeColumns.size()/2;
+  return numUnpredictedColumns < activeColumns.size() / 2;
 }
 
 //--------------------------------------------------------------------------------
 /**
  * Compute the predicted segments given the current set of active cells.
  */
-void Cells4::learnPhase2(bool readOnly)
-{
+void Cells4::learnPhase2(bool readOnly) {
   // Compute number of active synapses per segment based on forward propagation
   TIMER(forwardLearnPropTimer.start());
   computeForwardPropagation(_learnActiveStateT);
@@ -872,15 +847,16 @@ void Cells4::learnPhase2(bool readOnly)
     std::pair<UInt, UInt> p;
     p = getBestMatchingCellT(colIdx, _learnActiveStateT, _activationThreshold);
     UInt cellIdx = p.first, segIdx = p.second;
-    if (segIdx != (UInt) -1) {
+    if (segIdx != (UInt)-1) {
       // Turn on the predicted state for the best matching cell and queue
       // the pertinent segment up for an update, which will get processed if
       // the cell receives bottom up in the future.
       _learnPredictedStateT.set(cellIdx);
       if (!readOnly) {
         if (_verbosity >= 4) {
-          std::cout << "learnPhase2, learning on col=" << colIdx << ", cellIdx="
-          << cellIdx << ", seg ID: " << segIdx << ", segment: ";
+          std::cout << "learnPhase2, learning on col=" << colIdx
+                    << ", cellIdx=" << cellIdx << ", seg ID: " << segIdx
+                    << ", segment: ";
           _cells[cellIdx][segIdx].print(std::cout, _nCellsPerCol);
           std::cout << "\n";
         }
@@ -899,9 +875,8 @@ void Cells4::learnPhase2(bool readOnly)
 /**
  * Update the learning state. Called from compute()
  */
-void Cells4::updateLearningState(const std::vector<UInt> & activeColumns,
-                                 Real* input)
-{
+void Cells4::updateLearningState(const std::vector<UInt> &activeColumns,
+                                 Real *input) {
   // =========================================================================
   // Copy over learning states to t-1 and reset state at t to 0
   _learnActiveStateT1 = _learnActiveStateT;
@@ -932,13 +907,12 @@ void Cells4::updateLearningState(const std::vector<UInt> & activeColumns,
   }
   _learnedSeqLength++;
 
-  // =========================================================================
   // Phase 1 - turn on predicted cells in each column receiving bottom-up
 
   //---------------------------------------------------------------------------
   // For each column, turn on the predicted cell. At all times at most
   // 1 cell is active per column in the learn predicted state.
-  if (! _resetCalled) {
+  if (!_resetCalled) {
     bool inSequence = learnPhase1(activeColumns, false);
     if (inSequence) {
       _pamCounter = _pamLength;
@@ -947,8 +921,8 @@ void Cells4::updateLearningState(const std::vector<UInt> & activeColumns,
 
   // Print status of PAM counter, learned sequence length
   if (_verbosity >= 3) {
-    std::cout << "pamCounter = " << _pamCounter << ", learnedSeqLength = "
-              << _learnedSeqLength << "\n";
+    std::cout << "pamCounter = " << _pamCounter
+              << ", learnedSeqLength = " << _learnedSeqLength << "\n";
   }
 
   //---------------------------------------------------------------------------
@@ -956,30 +930,29 @@ void Cells4::updateLearningState(const std::vector<UInt> & activeColumns,
   //   1.) A reset was just called
   //   2.) We have been too long out of sequence (the pamCounter has expired)
   //   3.) We have reached maximum allowed sequence length.
-  if (  _resetCalled ||
-      ( _pamCounter==0) ||
-      ( (_maxSeqLength != 0) && (_learnedSeqLength >= _maxSeqLength) )
-     )
-  {
+  if (_resetCalled || (_pamCounter == 0) ||
+      ((_maxSeqLength != 0) && (_learnedSeqLength >= _maxSeqLength))) {
     if (_verbosity >= 3) {
       std::cout << "Starting over:";
       printActiveColumns(std::cout, activeColumns);
-      if (_resetCalled)           std::cout << "(reset was called)\n";
-      else if (_pamCounter == 0)  std::cout << "(PAM counter expired)\n";
-      else                        std::cout << "(reached maxSeqLength)\n";
+      if (_resetCalled)
+        std::cout << "(reset was called)\n";
+      else if (_pamCounter == 0)
+        std::cout << "(PAM counter expired)\n";
+      else
+        std::cout << "(reached maxSeqLength)\n";
     }
 
     // Update average learned sequence length - this is a diagnostic statistic
-    UInt seqLength = ( _pamCounter == 0 ?
-                       _learnedSeqLength - _pamLength :
-                       _learnedSeqLength );
+    UInt seqLength =
+        (_pamCounter == 0 ? _learnedSeqLength - _pamLength : _learnedSeqLength);
     if (_verbosity >= 3)
       std::cout << "  learned sequence length was: " << seqLength << "\n";
     _updateAvgLearnedSeqLength(seqLength);
 
     // Backtrack to an earlier starting point, if we find one
     UInt backsteps = 0;
-    if (! _resetCalled ) {
+    if (!_resetCalled) {
       TIMER(learnBacktrackTimer.start());
       backsteps = learnBacktrack();
       TIMER(learnBacktrackTimer.stop());
@@ -987,10 +960,10 @@ void Cells4::updateLearningState(const std::vector<UInt> & activeColumns,
 
     // Start over in the current time step if reset was called, or we couldn't
     // backtrack
-    if (_resetCalled || backsteps==0) {
+    if (_resetCalled || backsteps == 0) {
       _learnActiveStateT.resetAll();
-      for (auto & activeColumn : activeColumns) {
-        UInt cell0 = activeColumn*_nCellsPerCol;
+      for (auto &activeColumn : activeColumns) {
+        UInt cell0 = activeColumn * _nCellsPerCol;
         _learnActiveStateT.set(cell0);
       }
 
@@ -1004,13 +977,10 @@ void Cells4::updateLearningState(const std::vector<UInt> & activeColumns,
 
     // Clear out any old segment updates from prior sequences
     _segmentUpdates.clear();
-
   }
 
   // Done computing active state
 
-
-  // =========================================================================
   // Phase 2 - Compute new predicted state. When computing predictions for
   // phase 2, we predict at  most one cell per column (the one with the best
   // matching segment).
@@ -1018,24 +988,23 @@ void Cells4::updateLearningState(const std::vector<UInt> & activeColumns,
   learnPhase2(false);
 }
 
-
 //--------------------------------------------------------------------------------
 /**
  * Update the inference state. Called from compute() on every iteration
  */
-void Cells4::updateInferenceState(const std::vector<UInt> & activeColumns)
-{
+void Cells4::updateInferenceState(const std::vector<UInt> &activeColumns) {
   //---------------------------------------------------------------------------
   // Copy over inference related states to t-1
   // We need to do a copy here in case the buffers are numpy allocated
   // A possible optimization here is to do a swap if Cells4 owns its memory.
   _infActiveStateT1 = _infActiveStateT;
   _infPredictedStateT1 = _infPredictedStateT;
-  memcpy(_cellConfidenceT1, _cellConfidenceT, _nCells * sizeof(_cellConfidenceT[0]));
+  memcpy(_cellConfidenceT1, _cellConfidenceT,
+         _nCells * sizeof(_cellConfidenceT[0]));
 
   // Copy over previous column confidences
-  memcpy(_colConfidenceT1, _colConfidenceT, _nColumns * sizeof(_colConfidenceT[0]));
-
+  memcpy(_colConfidenceT1, _colConfidenceT,
+         _nColumns * sizeof(_colConfidenceT[0]));
 
   //---------------------------------------------------------------------------
   // Update our inference input history
@@ -1084,9 +1053,8 @@ void Cells4::updateInferenceState(const std::vector<UInt> & activeColumns)
  * Update the inference active state from the last set of predictions
  * and the current bottom-up.
  */
-bool Cells4::inferPhase1(const std::vector<UInt> & activeColumns,
-                         bool useStartCells)
-{
+bool Cells4::inferPhase1(const std::vector<UInt> &activeColumns,
+                         bool useStartCells) {
   TIMER(infPhase1Timer.start());
   //---------------------------------------------------------------------------
   // Initialize current active state to 0 to start
@@ -1098,9 +1066,8 @@ bool Cells4::inferPhase1(const std::vector<UInt> & activeColumns,
   // If we are following a reset, activate only the start cell in each
   // column that has bottom-up
   UInt numPredictedColumns = 0;
-  if (useStartCells)
-  {
-    for (auto & activeColumn : activeColumns) {
+  if (useStartCells) {
+    for (auto &activeColumn : activeColumns) {
       UInt cellIdx = activeColumn * _nCellsPerCol;
       _infActiveStateT.set(cellIdx);
     }
@@ -1108,14 +1075,12 @@ bool Cells4::inferPhase1(const std::vector<UInt> & activeColumns,
   }
   // else, for each column turn on any predicted cells. If there are none, then
   // turn on all cells (burst the column)
-  else
-  {
-    for (auto & activeColumn : activeColumns) {
+  else {
+    for (auto &activeColumn : activeColumns) {
       UInt cellIdx = activeColumn * _nCellsPerCol;
       UInt numPredictingCells = 0;
 
-      for (UInt ci = cellIdx; ci < cellIdx + _nCellsPerCol; ci++)
-      {
+      for (UInt ci = cellIdx; ci < cellIdx + _nCellsPerCol; ci++) {
         if (_infPredictedStateT1.isSet(ci)) {
           numPredictingCells++;
           _infActiveStateT.set(ci);
@@ -1124,12 +1089,10 @@ bool Cells4::inferPhase1(const std::vector<UInt> & activeColumns,
 
       if (numPredictingCells > 0) {
         numPredictedColumns += 1;
-      }
-      else {
-        //std::cout << "inferPhase1 bursting col=" << activeColumns[i] << "\n";
-        for (UInt ci = cellIdx; ci < cellIdx + _nCellsPerCol; ci++)
-        {
-          _infActiveStateT.set(ci);    // whole column bursts
+      } else {
+        // std::cout << "inferPhase1 bursting col=" << activeColumns[i] << "\n";
+        for (UInt ci = cellIdx; ci < cellIdx + _nCellsPerCol; ci++) {
+          _infActiveStateT.set(ci); // whole column bursts
         }
       }
     }
@@ -1137,7 +1100,8 @@ bool Cells4::inferPhase1(const std::vector<UInt> & activeColumns,
 
   TIMER(infPhase1Timer.stop());
   // Did we predict this input well enough?
-  return (useStartCells || (numPredictedColumns >= 0.50 * activeColumns.size()) );
+  return (useStartCells ||
+          (numPredictedColumns >= 0.50 * activeColumns.size()));
 }
 
 //------------------------------------------------------------------------------
@@ -1146,8 +1110,7 @@ bool Cells4::inferPhase1(const std::vector<UInt> & activeColumns,
  * then checks to insure that the predicted state is not over-saturated,
  * i.e. look too close like a burst.
  */
-bool Cells4::inferPhase2()
-{
+bool Cells4::inferPhase2() {
   // Compute number of active synapses per segment based on forward propagation
   TIMER(forwardInfPropTimer.start());
   computeForwardPropagation(_infActiveStateT);
@@ -1178,10 +1141,10 @@ bool Cells4::inferPhase2()
           // Run sanity check to ensure forward prop matches activity
           // calcuations (turned on in some tests)
           if (_checkSynapseConsistency) {
-            const Segment& seg = _cells[cellIdx][j];
-            UInt numActiveSyns = seg.computeActivity(
-                                    _infActiveStateT, _permConnected, false);
-            NTA_CHECK( numActiveSyns == _inferActivity.get(cellIdx, j) );
+            const Segment &seg = _cells[cellIdx][j];
+            UInt numActiveSyns =
+                seg.computeActivity(_infActiveStateT, _permConnected, false);
+            NTA_CHECK(numActiveSyns == _inferActivity.get(cellIdx, j));
           }
 
           // See if segment has a min number of active synapses
@@ -1213,19 +1176,19 @@ bool Cells4::inferPhase2()
   //---------------------------------------------------------------------------
   // Normalize column confidences
   if (sumColConfidence > 0) {
-    for (UInt c = 0; c < _nColumns; c++) _colConfidenceT[c] /= sumColConfidence;
-    for (UInt i = 0; i < _nCells; i++)   _cellConfidenceT[i] /= sumColConfidence;
+    for (UInt c = 0; c < _nColumns; c++)
+      _colConfidenceT[c] /= sumColConfidence;
+    for (UInt i = 0; i < _nCells; i++)
+      _cellConfidenceT[i] /= sumColConfidence;
   }
-
 
   // Turn off timer before we return
   TIMER(infPhase2Timer.stop());
 
   //---------------------------------------------------------------------------
   // Are we predicting the required minimum number of columns?
-  return (numPredictedCols >= (0.5*_avgInputDensity));
+  return (numPredictedCols >= (0.5 * _avgInputDensity));
 }
-
 
 //------------------------------------------------------------------------------
 /**
@@ -1247,15 +1210,17 @@ void Cells4::compute(Real* input, Real* output, bool doInference, bool doLearnin
   }
 
   if (_verbosity >= 3) {
-    std::cout << "\n==== CPP Iteration: " << _nIterations << " =====" << std::endl;
+    std::cout << "\n==== CPP Iteration: " << _nIterations
+              << " =====" << std::endl;
   }
 #endif
 
   // Create array of active bottom up column indices for later use
   static std::vector<UInt> activeColumns;
-  activeColumns.clear();                    // purge residual data
+  activeColumns.clear(); // purge residual data
   for (UInt i = 0; i != _nColumns; ++i) {
-    if (input[i]) activeColumns.push_back(i);
+    if (input[i])
+      activeColumns.push_back(i);
   }
 
   // Print active columns
@@ -1265,12 +1230,11 @@ void Cells4::compute(Real* input, Real* output, bool doInference, bool doLearnin
     std::cout << "\n";
   }
 
-
   //---------------------------------------------------------------------------
   // Update segment duty cycles if we are crossing a "tier"
 
   if (doLearning && Segment::atDutyCycleTier(_nLrnIterations)) {
-    for (auto & cell : _cells) {
+    for (auto &cell : _cells) {
       cell.updateDutyCycle(_nLrnIterations);
     }
   }
@@ -1278,11 +1242,12 @@ void Cells4::compute(Real* input, Real* output, bool doInference, bool doLearnin
   //---------------------------------------------------------------------------
   // Update average input density
   if (_avgInputDensity == 0.0) {
-    _avgInputDensity = (Real) activeColumns.size();
+    _avgInputDensity = (Real)activeColumns.size();
   } else {
     // TODO remove magic constants. should this be swarmed-over?
     const auto COOL_DOWN = (Real)0.99;
-    _avgInputDensity = COOL_DOWN*_avgInputDensity + (1-COOL_DOWN)*(Real)activeColumns.size();
+    _avgInputDensity = COOL_DOWN * _avgInputDensity +
+                       (1 - COOL_DOWN) * (Real)activeColumns.size();
   }
 
   //---------------------------------------------------------------------------
@@ -1328,22 +1293,30 @@ void Cells4::compute(Real* input, Real* output, bool doInference, bool doLearnin
   memset(output, 0, _nCells * sizeof(output[0])); // most output is zero
 #if SOME_STATES_NOT_INDEXED
 #if defined(NTA_ARCH_32)
-  const UInt multipleOf4 = 4 * (_nCells/4);
+  const UInt multipleOf4 = 4 * (_nCells / 4);
   UInt i;
   for (i = 0; i < multipleOf4; i += 4) {
-    UInt32 fourStates = * (UInt32 *)(_infPredictedStateT.arrayPtr() + i);
+    UInt32 fourStates = *(UInt32 *)(_infPredictedStateT.arrayPtr() + i);
     if (fourStates != 0) {
-      if ((fourStates & 0x000000ff) != 0) output[i + 0] = 1.0;
-      if ((fourStates & 0x0000ff00) != 0) output[i + 1] = 1.0;
-      if ((fourStates & 0x00ff0000) != 0) output[i + 2] = 1.0;
-      if ((fourStates & 0xff000000) != 0) output[i + 3] = 1.0;
+      if ((fourStates & 0x000000ff) != 0)
+        output[i + 0] = 1.0;
+      if ((fourStates & 0x0000ff00) != 0)
+        output[i + 1] = 1.0;
+      if ((fourStates & 0x00ff0000) != 0)
+        output[i + 2] = 1.0;
+      if ((fourStates & 0xff000000) != 0)
+        output[i + 3] = 1.0;
     }
-    fourStates = * (UInt32 *)(_infActiveStateT.arrayPtr() + i);
+    fourStates = *(UInt32 *)(_infActiveStateT.arrayPtr() + i);
     if (fourStates != 0) {
-      if ((fourStates & 0x000000ff) != 0) output[i + 0] = 1.0;
-      if ((fourStates & 0x0000ff00) != 0) output[i + 1] = 1.0;
-      if ((fourStates & 0x00ff0000) != 0) output[i + 2] = 1.0;
-      if ((fourStates & 0xff000000) != 0) output[i + 3] = 1.0;
+      if ((fourStates & 0x000000ff) != 0)
+        output[i + 0] = 1.0;
+      if ((fourStates & 0x0000ff00) != 0)
+        output[i + 1] = 1.0;
+      if ((fourStates & 0x00ff0000) != 0)
+        output[i + 2] = 1.0;
+      if ((fourStates & 0xff000000) != 0)
+        output[i + 3] = 1.0;
     }
   }
 
@@ -1351,36 +1324,51 @@ void Cells4::compute(Real* input, Real* output, bool doInference, bool doLearnin
   for (i = multipleOf4; i < _nCells; i++) {
     if (_infPredictedStateT.isSet(i)) {
       output[i] = 1.0;
-    }
-    else if (_infActiveStateT.isSet(i)) {
+    } else if (_infActiveStateT.isSet(i)) {
       output[i] = 1.0;
     }
   }
 #else
-  const UInt multipleOf8 = 8 * (_nCells/8);
+  const UInt multipleOf8 = 8 * (_nCells / 8);
   UInt i;
   for (i = 0; i < multipleOf8; i += 8) {
-    UInt64 eightStates = * (UInt64 *)(_infPredictedStateT.arrayPtr() + i);
+    UInt64 eightStates = *(UInt64 *)(_infPredictedStateT.arrayPtr() + i);
     if (eightStates != 0) {
-      if ((eightStates & 0x00000000000000ff) != 0) output[i + 0] = 1.0;
-      if ((eightStates & 0x000000000000ff00) != 0) output[i + 1] = 1.0;
-      if ((eightStates & 0x0000000000ff0000) != 0) output[i + 2] = 1.0;
-      if ((eightStates & 0x00000000ff000000) != 0) output[i + 3] = 1.0;
-      if ((eightStates & 0x000000ff00000000) != 0) output[i + 4] = 1.0;
-      if ((eightStates & 0x0000ff0000000000) != 0) output[i + 5] = 1.0;
-      if ((eightStates & 0x00ff000000000000) != 0) output[i + 6] = 1.0;
-      if ((eightStates & 0xff00000000000000) != 0) output[i + 7] = 1.0;
+      if ((eightStates & 0x00000000000000ff) != 0)
+        output[i + 0] = 1.0;
+      if ((eightStates & 0x000000000000ff00) != 0)
+        output[i + 1] = 1.0;
+      if ((eightStates & 0x0000000000ff0000) != 0)
+        output[i + 2] = 1.0;
+      if ((eightStates & 0x00000000ff000000) != 0)
+        output[i + 3] = 1.0;
+      if ((eightStates & 0x000000ff00000000) != 0)
+        output[i + 4] = 1.0;
+      if ((eightStates & 0x0000ff0000000000) != 0)
+        output[i + 5] = 1.0;
+      if ((eightStates & 0x00ff000000000000) != 0)
+        output[i + 6] = 1.0;
+      if ((eightStates & 0xff00000000000000) != 0)
+        output[i + 7] = 1.0;
     }
-    eightStates = * (UInt64 *)(_infActiveStateT.arrayPtr() + i);
+    eightStates = *(UInt64 *)(_infActiveStateT.arrayPtr() + i);
     if (eightStates != 0) {
-      if ((eightStates & 0x00000000000000ff) != 0) output[i + 0] = 1.0;
-      if ((eightStates & 0x000000000000ff00) != 0) output[i + 1] = 1.0;
-      if ((eightStates & 0x0000000000ff0000) != 0) output[i + 2] = 1.0;
-      if ((eightStates & 0x00000000ff000000) != 0) output[i + 3] = 1.0;
-      if ((eightStates & 0x000000ff00000000) != 0) output[i + 4] = 1.0;
-      if ((eightStates & 0x0000ff0000000000) != 0) output[i + 5] = 1.0;
-      if ((eightStates & 0x00ff000000000000) != 0) output[i + 6] = 1.0;
-      if ((eightStates & 0xff00000000000000) != 0) output[i + 7] = 1.0;
+      if ((eightStates & 0x00000000000000ff) != 0)
+        output[i + 0] = 1.0;
+      if ((eightStates & 0x000000000000ff00) != 0)
+        output[i + 1] = 1.0;
+      if ((eightStates & 0x0000000000ff0000) != 0)
+        output[i + 2] = 1.0;
+      if ((eightStates & 0x00000000ff000000) != 0)
+        output[i + 3] = 1.0;
+      if ((eightStates & 0x000000ff00000000) != 0)
+        output[i + 4] = 1.0;
+      if ((eightStates & 0x0000ff0000000000) != 0)
+        output[i + 5] = 1.0;
+      if ((eightStates & 0x00ff000000000000) != 0)
+        output[i + 6] = 1.0;
+      if ((eightStates & 0xff00000000000000) != 0)
+        output[i + 7] = 1.0;
     }
   }
 
@@ -1388,8 +1376,7 @@ void Cells4::compute(Real* input, Real* output, bool doInference, bool doLearnin
   for (i = multipleOf8; i < _nCells; i++) {
     if (_infPredictedStateT.isSet(i)) {
       output[i] = 1.0;
-    }
-    else if (_infActiveStateT.isSet(i)) {
+    } else if (_infActiveStateT.isSet(i)) {
       output[i] = 1.0;
     }
   }
@@ -1403,10 +1390,9 @@ void Cells4::compute(Real* input, Real* output, bool doInference, bool doLearnin
   cellsOn = _infActiveStateT.cellsOn();
   for (iterOn = cellsOn.begin(); iterOn != cellsOn.end(); ++iterOn)
     output[*iterOn] = 1.0;
-#endif  // SOME_STATES_NOT_INDEXED
+#endif // SOME_STATES_NOT_INDEXED
 
-  if (_checkSynapseConsistency)
-  {
+  if (_checkSynapseConsistency) {
     NTA_CHECK(invariants(true));
   }
   TIMER(computeTimer.stop());
@@ -1416,20 +1402,18 @@ void Cells4::compute(Real* input, Real* output, bool doInference, bool doLearnin
 /**
  * Update our moving average of learned sequence length.
  */
-void Cells4::_updateAvgLearnedSeqLength(UInt prevSeqLength)
-{
-  Real alpha = 0.1;
-  if (_nLrnIterations < 100) alpha = 0.5;
+void Cells4::_updateAvgLearnedSeqLength(UInt prevSeqLength) {
+  Real alpha = 0.1f;
+  if (_nLrnIterations < 100)
+    alpha = 0.5f;
   if (_verbosity >= 5) {
-    std::cout << "_updateAvgLearnedSeqLength before = "
-              << _avgLearnedSeqLength << " prevSeqLength = "
-              << prevSeqLength << "\n";
+    std::cout << "_updateAvgLearnedSeqLength before = " << _avgLearnedSeqLength
+              << " prevSeqLength = " << prevSeqLength << "\n";
   }
-  _avgLearnedSeqLength = (1.0 - alpha)*_avgLearnedSeqLength +
-                         alpha * (Real) prevSeqLength;
+  _avgLearnedSeqLength =
+      (1.0f - alpha) * _avgLearnedSeqLength + alpha * (Real)prevSeqLength;
   if (_verbosity >= 5) {
-    std::cout << "   after = "
-    << _avgLearnedSeqLength << "\n";
+    std::cout << "   after = " << _avgLearnedSeqLength << "\n";
   }
 }
 
@@ -1437,55 +1421,37 @@ void Cells4::_updateAvgLearnedSeqLength(UInt prevSeqLength)
 /**
  * Go through the list of accumulated segment updates and process them.
  */
-void Cells4::processSegmentUpdates(Real* input, const CState& predictedState)
-{
-  static std::vector<UInt> delUpdates;
-  delUpdates.clear();                       // purge residual data
+void Cells4::processSegmentUpdates(const Real32 input[], const CState &predictedState) {
 
-  for (UInt i = 0; i != _segmentUpdates.size(); ++i) {
+  // Decide whether to apply the update now. If update has expired, then
+  // mark this update for deletion
+  const auto rm_expired = [&](const SegmentUpdate& update) {
+    return (_nLrnIterations - update.timeStamp() > _segUpdateValidDuration);
+  };
 
-    const SegmentUpdate& update = _segmentUpdates[i];
-
-    if (_verbosity >= 4) {
-      std::cout << "\n_nLrnIterations: " << _nLrnIterations
-                << " segment update: ";
-      update.print(std::cout, true, _nCellsPerCol);
-      std::cout << std::endl;
-    }
-
-    // Decide whether to apply the update now. If update has expired, then
-    // mark this update for deletion
-    if (_nLrnIterations - update.timeStamp() > _segUpdateValidDuration) {
-      if (_verbosity >= 4) std::cout << "     Expired, deleting now.\n";
-      delUpdates.push_back(i);
-    }
-
-    // Update has not expired
-    else {
-      UInt cellIdx = update.cellIdx();
-      UInt colIdx =  (UInt) (cellIdx / _nCellsPerCol);
-
-      // If we received bottom up input, then adapt this segment and schedule
-      // update for removal
-      if ( input[colIdx] == 1 ) {
-
-        if (_verbosity >= 4) std::cout << "     Applying update now.\n";
+  // If we received bottom up input, then adapt this segment and schedule
+  // update for removal
+  const auto rm_bottomUpInput = [&](const SegmentUpdate& update) {
+      const UInt colIdx = (UInt)(update.cellIdx() / _nCellsPerCol);
+      if (input[colIdx] == 1) {
         adaptSegment(update);
-        delUpdates.push_back(i);
-      } else {
-        // We didn't receive bottom up input. If we are not (pooling and still
-        // predicting) then delete this update
-        if ( ! (_doPooling && predictedState.isSet(cellIdx)) ) {
-          if (_verbosity >= 4) std::cout << "     Deleting update now.\n";
-          delUpdates.push_back(i);
-        }
-      }
+	return true; //delete
+      } else { return false; }
+  };
 
-    } // unexpired update
+  // We didn't receive bottom up input. If we are not (pooling and still
+  // predicting) then delete this update
+  const auto rm_noInputAndPredicting = [&](const SegmentUpdate& update) {
+    return !(_doPooling && predictedState.isSet(update.cellIdx()));
+  };
 
-  } // Loop over updates
-
-  remove_at(delUpdates, _segmentUpdates);
+  /**
+   * the following 3 statements are order dependant, ie you can imagine 
+   * this as: if {st 1} else { if {st 2} else {st 3}}
+   */
+  _segmentUpdates.erase(remove_if(_segmentUpdates.begin(), _segmentUpdates.end(), rm_expired), _segmentUpdates.end());
+  _segmentUpdates.erase(remove_if(_segmentUpdates.begin(), _segmentUpdates.end(), rm_bottomUpInput), _segmentUpdates.end());
+  _segmentUpdates.erase(remove_if(_segmentUpdates.begin(), _segmentUpdates.end(), rm_noInputAndPredicting), _segmentUpdates.end());
 
 }
 
@@ -1494,38 +1460,10 @@ void Cells4::processSegmentUpdates(Real* input, const CState& predictedState)
  * Removes any updates that would be applied to the given col,
  * cellIdx, segIdx.
  */
-void Cells4::cleanUpdatesList(UInt cellIdx, UInt segIdx)
-{
-  static std::vector<UInt> delUpdates;
-  delUpdates.clear();                       // purge residual data
-
-  for (UInt i = 0; i != _segmentUpdates.size(); ++i) {
-
-    // Get the cell and column associated with this update
-    const SegmentUpdate& update = _segmentUpdates[i];
-
-    if (_verbosity >= 4) {
-      std::cout << "\nIn cleanUpdatesList. _nLrnIterations: " << _nLrnIterations
-      << " checking segment: ";
-      update.print(std::cout, true, _nCellsPerCol);
-      std::cout << std::endl;
-    }
-
-    // Decide whether to remove update. Note: we can't remove update from
-    // vector while we are iterating over it.
-    if ( (update.cellIdx() == cellIdx) && (segIdx == update.segIdx()) )
-    {
-      if (_verbosity >= 4) {
-        std::cout << "    Removing it\n";
-      }
-
-      delUpdates.push_back(i);
-    }
-
-  } // Loop over updates
-
-  // Remove any we found
-  remove_at(delUpdates, _segmentUpdates);
+void Cells4::cleanUpdatesList(const UInt cellIdx, const UInt segIdx) {
+  const auto remove_match = [&cellIdx, &segIdx](const SegmentUpdate& update) {
+	  return ((update.cellIdx() == cellIdx) && (segIdx == update.segIdx())); };
+  _segmentUpdates.erase(remove_if(_segmentUpdates.begin(), _segmentUpdates.end(), remove_match), _segmentUpdates.end());      
 }
 
 //----------------------------------------------------------------------
@@ -1533,24 +1471,23 @@ void Cells4::cleanUpdatesList(UInt cellIdx, UInt segIdx)
  * Apply age-based global decay logic and remove segments/synapses
  * as appropriate.
  */
-void Cells4::applyGlobalDecay()
-{
+void Cells4::applyGlobalDecay() {
   UInt nSegmentsDecayed = 0, nSynapsesRemoved = 0;
-  if (_globalDecay != 0 && (_maxAge>0) && (_nLrnIterations % _maxAge == 0) ) {
+  if (_globalDecay != 0 && (_maxAge > 0) && (_nLrnIterations % _maxAge == 0)) {
     for (UInt cellIdx = 0; cellIdx != _nCells; ++cellIdx) {
       for (UInt segIdx = 0; segIdx != _cells[cellIdx].size(); ++segIdx) {
 
-        Segment& seg = segment(cellIdx, segIdx);
+        Segment &seg = segment(cellIdx, segIdx);
         UInt age = _nLrnIterations - seg._lastActiveIteration;
 
-        if ( age > _maxAge ) {
+        if (age > _maxAge) {
 
           static std::vector<UInt> removedSynapses;
-          removedSynapses.clear();          // purge residual data
+          removedSynapses.clear(); // purge residual data
           nSegmentsDecayed++;
 
           seg.decaySynapses2(_globalDecay, removedSynapses, _permConnected);
-          nSynapsesRemoved += removedSynapses.size();
+          nSynapsesRemoved += (UInt)removedSynapses.size();
           if (!removedSynapses.empty()) {
             eraseOutSynapses(cellIdx, segIdx, removedSynapses);
           }
@@ -1558,20 +1495,19 @@ void Cells4::applyGlobalDecay()
           if (seg.empty()) {
             _cells[cellIdx].releaseSegment(segIdx);
           }
-
         }
       }
     }
     if (_verbosity >= 3) {
       std::cout << "CPP Global decay decremented " << nSegmentsDecayed
-                << " segments and removed "
-                << nSynapsesRemoved << " synapses\n";
-      std::cout << "_nLrnIterations = " << _nLrnIterations << ", _maxAge = "
-                << _maxAge << ", globalDecay = " << _globalDecay << "\n";
+                << " segments and removed " << nSynapsesRemoved
+                << " synapses\n";
+      std::cout << "_nLrnIterations = " << _nLrnIterations
+                << ", _maxAge = " << _maxAge
+                << ", globalDecay = " << _globalDecay << "\n";
     }
   } // (_globalDecay)
 }
-
 
 //--------------------------------------------------------------------------------
 /**
@@ -1583,13 +1519,11 @@ void Cells4::applyGlobalDecay()
  *
  */
 void Cells4::_generateListsOfSynapsesToAdjustForAdaptSegment(
-  const Segment& segment,
-  std::set<UInt>& synapsesSet,
-  std::vector<UInt>& inactiveSrcCellIdxs,
-  std::vector<UInt>& inactiveSynapseIdxs,
-  std::vector<UInt>& activeSrcCellIdxs,
-  std::vector<UInt>& activeSynapseIdxs)
-{
+    const Segment &segment, std::set<UInt> &synapsesSet,
+    std::vector<UInt> &inactiveSrcCellIdxs,
+    std::vector<UInt> &inactiveSynapseIdxs,
+    std::vector<UInt> &activeSrcCellIdxs,
+    std::vector<UInt> &activeSynapseIdxs) {
   // Purge residual data
   inactiveSrcCellIdxs.clear();
   inactiveSynapseIdxs.clear();
@@ -1598,18 +1532,17 @@ void Cells4::_generateListsOfSynapsesToAdjustForAdaptSegment(
 
   for (UInt i = 0; i != segment.size(); ++i) {
     const UInt srcCellIdx = segment[i].srcCellIdx();
-    if (not_in(srcCellIdx, synapsesSet)) {
+    const bool not_in = std::find(synapsesSet.cbegin(), synapsesSet.cend(), srcCellIdx) == synapsesSet.cend();
+    if (not_in) {
       inactiveSrcCellIdxs.push_back(srcCellIdx);
       inactiveSynapseIdxs.push_back(i);
-    }
-    else {
+    } else {
       activeSrcCellIdxs.push_back(srcCellIdx);
       synapsesSet.erase(srcCellIdx); // those that remain will be created
       activeSynapseIdxs.push_back(i);
     }
   }
 }
-
 
 //--------------------------------------------------------------------------------
 /**
@@ -1620,8 +1553,7 @@ void Cells4::_generateListsOfSynapsesToAdjustForAdaptSegment(
  * TODO: This whole method is really ugly and could do with a serious cleanup.
  *
  */
-void Cells4::adaptSegment(const SegmentUpdate& update)
-{
+void Cells4::adaptSegment(const SegmentUpdate &update) {
   TIMER(adaptSegmentTimer.start());
   {
     // consistency checks:
@@ -1632,7 +1564,7 @@ void Cells4::adaptSegment(const SegmentUpdate& update)
   UInt cellIdx = update.cellIdx();
   UInt segIdx = update.segIdx();
 
-  if (! update.isNewSegment()) { // modify an existing segment
+  if (!update.isNewSegment()) { // modify an existing segment
 
     // Sometimes you can have a pending update after a segment has already
     // been released. It's cheaper to deal with it here rather than do
@@ -1642,13 +1574,13 @@ void Cells4::adaptSegment(const SegmentUpdate& update)
       return;
     }
 
-    Segment& segment = _cells[cellIdx][segIdx];
+    Segment &segment = _cells[cellIdx][segIdx];
 
     if (_verbosity >= 4) {
-      UInt col =  (UInt) (cellIdx / _nCellsPerCol);
-      UInt cell = cellIdx - col*_nCellsPerCol;
-      std::cout << "Reinforcing segment " << segIdx << " for cell["
-                << col<< "," << cell << "]\n     before: ";
+      UInt col = (UInt)(cellIdx / _nCellsPerCol);
+      UInt cell = cellIdx - col * _nCellsPerCol;
+      std::cout << "Reinforcing segment " << segIdx << " for cell[" << col
+                << "," << cell << "]\n     before: ";
       segment.print(std::cout, _nCellsPerCol);
       std::cout << std::endl;
     }
@@ -1675,7 +1607,8 @@ void Cells4::adaptSegment(const SegmentUpdate& update)
     // NOTE: the following variables were declared static as a performance
     // optimization in the legacy code in order to reduce memory allocations.
     // The side effect is that this code is not thread-safe. At the time,
-    // processes were the mechanism for parllelizing execution of the algorithms.
+    // processes were the mechanism for parllelizing execution of the
+    // algorithms.
 
     // Tracks source cell indexes corresponding to synapses in
     // the given segment that have been removed during execution of this method
@@ -1687,17 +1620,15 @@ void Cells4::adaptSegment(const SegmentUpdate& update)
     // Indexes of synapses within the current segment corresponding to synapses
     // that are inactive/active in ascending order; these variables correlate
     // with synToDec and synToInc.
-    static std::vector<UInt> inactiveSegmentIndices,
-                             activeSegmentIndices;
+    static std::vector<UInt> inactiveSegmentIndices, activeSegmentIndices;
 
     // Purge residual data from static variable; the others will be purged by
     // _generateListsOfSynapsesToAdjustForAdaptSegment
     removed.clear();
 
     _generateListsOfSynapsesToAdjustForAdaptSegment(
-      segment, synapsesSet,
-      synToDec, inactiveSegmentIndices,
-      synToInc, activeSegmentIndices);
+        segment, synapsesSet, synToDec, inactiveSegmentIndices, synToInc,
+        activeSegmentIndices);
 
     // Decrement permanences of inactive synapses
     segment.updateSynapses(synToDec, - _permDec, _permMax, _permConnected, removed);
@@ -1715,22 +1646,22 @@ void Cells4::adaptSegment(const SegmentUpdate& update)
     }
 
     // Increment permanences of active synapses
-    const UInt numRemovedBeforePermInc = removed.size();
-    segment.updateSynapses(synToInc, _permInc, _permMax, _permConnected, removed);
+    const size_t numRemovedBeforePermInc = removed.size();
+    segment.updateSynapses(synToInc, _permInc, _permMax, _permConnected,
+                           removed);
     // Incrementing of permanences shouldn't remove synapses
-    NTA_CHECK(removed.size() == numRemovedBeforePermInc);
+    NTA_ASSERT(removed.size() == numRemovedBeforePermInc) << numRemovedBeforePermInc; 
 
     // If we have fixed resources, get rid of some old synapses, if necessary
-    if ( (_maxSynapsesPerSegment > 0) &&
-         (synapsesSet.size() + segment.size() > (UInt) _maxSynapsesPerSegment) ) {
+    if ((_maxSynapsesPerSegment > 0) &&
+        (synapsesSet.size() + segment.size() > (UInt)_maxSynapsesPerSegment)) {
       // TODO: What's preventing numToFree from exceeding segment.size()? If you
       // know, add a comment explaining it. If it exceeds, it will cause memory
       // corruption in Segment::freeNSynapses.
-      UInt numToFree = synapsesSet.size() + segment.size() - _maxSynapsesPerSegment;
-      segment.freeNSynapses(numToFree,
-                            synToDec, inactiveSegmentIndices,
-                            synToInc, activeSegmentIndices,
-                            removed, _verbosity,
+      UInt numToFree =
+          (UInt)(synapsesSet.size() + segment.size() - _maxSynapsesPerSegment);
+      segment.freeNSynapses(numToFree, synToDec, inactiveSegmentIndices,
+                            synToInc, activeSegmentIndices, removed, _verbosity,
                             _nCellsPerCol, _permMax);
     }
 
@@ -1763,10 +1694,9 @@ void Cells4::adaptSegment(const SegmentUpdate& update)
     for (UInt i = 0; i != update.size(); ++i) {
       synapses.push_back(InSynapse(update[i], _permInitial));
     }
-    UInt segIdx =
-      _cells[cellIdx].getFreeSegment(synapses, _initSegFreq,
-                                   update.isSequenceSegment(), _permConnected,
-                                     _nLrnIterations);
+    UInt segIdx = _cells[cellIdx].getFreeSegment(
+        synapses, _initSegFreq, update.isSequenceSegment(), _permConnected,
+        _nLrnIterations);
 
     // Initialize the new segment's last active iteration and frequency related
     // counts
@@ -1782,9 +1712,7 @@ void Cells4::adaptSegment(const SegmentUpdate& update)
       std::cout << std::endl;
     }
 
-
     addOutSynapses(cellIdx, segIdx, update.begin(), update.end());
-
   }
 
   if (_checkSynapseConsistency) {
@@ -1794,15 +1722,12 @@ void Cells4::adaptSegment(const SegmentUpdate& update)
   TIMER(adaptSegmentTimer.stop());
 }
 
-
-
 // Rebalance segment lists for each cell
-void Cells4::_rebalance()
-{
+void Cells4::_rebalance() {
   std::cout << "Rebalancing\n";
   _nIterationsSinceRebalance = _nLrnIterations;
 
-  for (auto & cell : _cells) {
+  for (auto &cell : _cells) {
     if (!cell.empty()) {
       cell.rebalanceSegments();
     }
@@ -1810,7 +1735,6 @@ void Cells4::_rebalance()
 
   // After rebalancing we need to redo the OutSynapses
   rebuildOutSynapses();
-
 }
 
 //--------------------------------------------------------------------------------
@@ -1818,18 +1742,17 @@ void Cells4::_rebalance()
  * Removes any old segment that has not been touched for maxAge iterations and
  * where the number of connected synapses is less than activation threshold.
  */
-void Cells4::trimOldSegments(UInt maxAge)
-{
+void Cells4::trimOldSegments(UInt maxAge) {
   UInt nSegsRemoved = 0;
 
   for (UInt cellIdx = 0; cellIdx != _nCells; ++cellIdx) {
     for (UInt segIdx = 0; segIdx != _cells[cellIdx].size(); ++segIdx) {
-      Segment& seg = segment(cellIdx, segIdx);
+      Segment &seg = segment(cellIdx, segIdx);
       UInt age = _nLrnIterations - seg._lastActiveIteration;
 
-      if ( (age > maxAge) && (seg.nConnected() < _activationThreshold) ) {
+      if ((age > maxAge) && (seg.nConnected() < _activationThreshold)) {
         static std::vector<UInt> removedSynapses;
-        removedSynapses.clear();            // purge residual data
+        removedSynapses.clear(); // purge residual data
 
         for (UInt i = 0; i != seg.size(); ++i)
           removedSynapses.push_back(seg[i].srcCellIdx());
@@ -1837,20 +1760,17 @@ void Cells4::trimOldSegments(UInt maxAge)
         eraseOutSynapses(cellIdx, segIdx, removedSynapses);
         _cells[cellIdx].releaseSegment(segIdx);
         nSegsRemoved++;
-
       }
     }
   }
 
   std::cout << "In trimOldSegments. Removed " << nSegsRemoved << " segments\n";
   NTA_CHECK(invariants());
-
 }
 
 // Clear out and rebuild the entire _outSynapses data structure
 // This is useful if segments have changed.
-void Cells4::rebuildOutSynapses()
-{
+void Cells4::rebuildOutSynapses() {
   // TODO: Is this logic sufficient?
   _outSynapses.resize(_nCells);
 
@@ -1863,7 +1783,7 @@ void Cells4::rebuildOutSynapses()
   // data structure
   for (UInt dstCellIdx = 0; dstCellIdx != _nCells; ++dstCellIdx) {
     for (UInt segIdx = 0; segIdx != _cells[dstCellIdx].size(); ++segIdx) {
-      const Segment& seg = _cells[dstCellIdx][segIdx];
+      const Segment &seg = _cells[dstCellIdx][segIdx];
       for (UInt synIdx = 0; synIdx != seg.size(); ++synIdx) {
         UInt srcCellIdx = seg.getSrcCellIdx(synIdx);
         OutSynapse newOutSyn(dstCellIdx, segIdx);
@@ -1885,7 +1805,8 @@ void Cells4::rebuildOutSynapses()
       UInt destCol =  (UInt) (syn.dstCellIdx() / _nCellsPerCol);
       UInt destCell = syn.dstCellIdx() - destCol*_nCellsPerCol;
 
-      std::cout << "\n       [" << syn.dstCellIdx() << " : " << destCol << "," << destCell
+      std::cout << "\n       [" << syn.dstCellIdx() << " : " << destCol << ","
+  << destCell
                 << "] segment: " << syn.dstSegIdx() << ",";
 
     }
@@ -1893,15 +1814,12 @@ void Cells4::rebuildOutSynapses()
   }
   std::cout << "\n";
   */
-
 }
-
 
 //--------------------------------------------------------------------------------
 /**
  */
-void Cells4::reset()
-{
+void Cells4::reset() {
   if (_verbosity >= 3) {
     std::cout << "\n==== RESET =====\n";
   }
@@ -1913,6 +1831,7 @@ void Cells4::reset()
   _learnActiveStateT1.resetAll();
   _learnPredictedStateT.resetAll();
   _learnPredictedStateT1.resetAll();
+
   memset(_cellConfidenceT, 0, _nCells * sizeof(_cellConfidenceT[0]));
   memset(_cellConfidenceT1, 0, _nCells * sizeof(_cellConfidenceT1[0]));
   memset(_colConfidenceT, 0, _nColumns * sizeof(_colConfidenceT[0]));
@@ -1926,216 +1845,385 @@ void Cells4::reset()
   // Clear out input history
   _prevInfPatterns.clear();
   _prevLrnPatterns.clear();
-  //if (_nLrnIterations - _nIterationsSinceRebalance > 1000) {
+  // if (_nLrnIterations - _nIterationsSinceRebalance > 1000) {
   //  //_rebalance();
   //}
 }
 
+// This structure is used only to allow serialization to write as a binary block.
+// Therefore it must be only POD (plain old data).  Not classes, no pointers, etc.
+struct serializedState_t {
+  Real initSegFreq;
+  Real permInitial;
+  Real permConnected;
+  Real permMax;
+  Real permDec;
+  Real permInc;
+  Real globalDecay;
+  Real avgLearnedSeqLength;
+  Real avgInputDensity;
+  Real padding1;
+  UInt nColumns;
+  UInt nCellsPerCol;
+  UInt nCells;
+  UInt activationThreshold;
+  UInt minThreshold;
+  UInt newSynapseCount;
+  UInt nIterations;
+  UInt nLrnIterations;
+  UInt segUpdateValidDuration;
+  UInt pamLength;
+  UInt maxInfBacktrack;
+  UInt maxLrnBacktrack;
+  UInt maxSeqLength;
+  UInt learnedSeqLength;
+  UInt maxAge;
+  UInt verbosity;
+  UInt pamCounter;
+  Int maxSegmentsPerCell;
+  Int maxSynapsesPerSegment;
+  Int padding2;
+  bool doPooling;
+  bool checkSynapseConsistency;
+  bool resetCalled;
+};
+// NOTE:  ownsMemory cannot be saved in serialization.
+//        It indicates who currently allocated the buffers.
+
+
+
 //--------------------------------------------------------------------------------
-void Cells4::save(std::ostream& outStream) const
-{
+void Cells4::save(std::ostream &outStream) const {
   // Check invariants for smaller networks or if explicitly requested
-  if (_checkSynapseConsistency || (_nCells * _maxSegmentsPerCell < 100000) )
-  {
-    NTA_CHECK(invariants(true));
+  NTA_CHECK(invariants(true));
+
+  // Capture the class variables and write them as a binary block.
+  struct serializedState_t self;
+  memset(&self, 0, sizeof(self));
+  self.nColumns = _nColumns;
+  self.nCellsPerCol = _nCellsPerCol;
+  self.nCells = _nCells;
+  self.activationThreshold = _activationThreshold;
+  self.minThreshold = _minThreshold;
+  self.newSynapseCount = _newSynapseCount;
+  self.nIterations = _nIterations;
+  self.nLrnIterations = _nLrnIterations;
+  self.segUpdateValidDuration = _segUpdateValidDuration;
+  self.initSegFreq = _initSegFreq;
+  self.permInitial = _permInitial;
+  self.permConnected = _permConnected;
+  self.permMax = _permMax;
+  self.permDec = _permDec;
+  self.permInc = _permInc;
+  self.globalDecay = _globalDecay;
+  self.doPooling = _doPooling;
+  self.pamLength = _pamLength;
+  self.maxInfBacktrack = _maxInfBacktrack;
+  self.maxLrnBacktrack = _maxLrnBacktrack;
+  self.maxSeqLength = _maxSeqLength;
+  self.learnedSeqLength = _learnedSeqLength;
+  self.avgLearnedSeqLength = _avgLearnedSeqLength;
+  self.maxAge = _maxAge;
+  self.verbosity = _verbosity;
+  self.maxSegmentsPerCell = _maxSegmentsPerCell;
+  self.maxSynapsesPerSegment = _maxSynapsesPerSegment;
+  self.checkSynapseConsistency = _checkSynapseConsistency;
+  self.avgInputDensity = _avgInputDensity;
+  self.pamCounter = _pamCounter;
+  self.resetCalled = _resetCalled;
+
+  outStream << "Cells4 " << _version << " ";
+  outStream << "self " << sizeof(self) << " ";
+  outStream.write((const char *)&self, sizeof(self));
+  outStream << std::endl;
+
+  // capture the current state of the random number generator.
+  outStream << _rng << "\n";
+
+  // capture the inferred states
+  outStream << "infActiveStateT" << std::endl;
+  _infActiveStateT.save(outStream);
+  outStream << "infActiveStateT1" << std::endl;
+  _infActiveStateT1.save(outStream);
+  outStream << "infPredictedStateT" << std::endl;
+  _infPredictedStateT.save(outStream);
+  outStream << "infPredictedStateT1" << std::endl;
+  _infPredictedStateT1.save(outStream);
+
+  // capture the learn states
+  outStream << "learnActiveStateT" << std::endl;
+  _learnActiveStateT.save(outStream);
+  outStream << "learnActiveStateT1" << std::endl;
+  _learnActiveStateT1.save(outStream);
+  outStream << "learnPredictedStateT" << std::endl;
+  _learnPredictedStateT.save(outStream);
+  outStream << "learnPredictedStateT1" << std::endl;
+  _learnPredictedStateT1.save(outStream);
+  outStream << std::endl;
+
+  // capture the prev states (for backtracking)
+  // (these are deque's of vectors of UInt, see StlIo.hpp)
+  outStream << "prevInfPatterns [ " << _prevInfPatterns.size() << "\n";
+  for(auto v : _prevInfPatterns) {
+    outStream << v.size() << " ";
+    binary_save(outStream, v);
+    outStream << "\n";
   }
+  outStream << "]\n";
 
-  outStream << version() << " "
-            << _ownsMemory << " "
-            << _rng << " "
-            << _nColumns << " "
-            << _nCellsPerCol << " "
-            << _activationThreshold << " "
-            << _minThreshold << " "
-            << _newSynapseCount << " "
-            << _nIterations << " "
-            << _segUpdateValidDuration << " "
-            << _initSegFreq << " "
-            << _permInitial << " "
-            << _permConnected << " "
-            << _permMax << " "
-            << _permDec << " "
-            << _permInc << " "
-            << _globalDecay << " "
-            << _doPooling << " "
-            << _maxInfBacktrack << " "
-            << _maxLrnBacktrack << " "
-            << _pamLength << " "
-            << _maxAge << " "
-            << _avgInputDensity << " "
-            << _pamCounter << " "
-            << _maxSeqLength << " "
-            << _avgLearnedSeqLength << " "
-            << _nLrnIterations << " "
-            << _maxSegmentsPerCell << " "
-            << _maxSynapsesPerSegment << " "
-            << std::endl;
+  outStream << "prevLrnPatterns [ " << _prevLrnPatterns.size() << "\n";
+  for(auto v : _prevLrnPatterns) {
+    outStream << v.size() << " ";
+    binary_save(outStream, v);
+    outStream << "\n";
+  }
+  outStream << "]\n";
 
-  // Additions in version 1.
-  outStream << _learnedSeqLength << " "
-            << _verbosity << " "
-            << _checkSynapseConsistency << " "
-            << _resetCalled << std::endl;
-  outStream << _learnActiveStateT << " "
-            << _learnActiveStateT1 << " "
-            << _learnPredictedStateT << " "
-            << _learnPredictedStateT1 << std::endl;
+  outStream << "cellConfidenceT [ " << _nCells << "\n";
+  outStream.write((const char*)_cellConfidenceT, _nCells * sizeof(Real));
+  outStream << "\n]\n";
+  outStream << "cellConfidenceT1 [ " << _nCells << "\n";
+  outStream.write((const char*)_cellConfidenceT1, _nCells * sizeof(Real));
+  outStream << "\n]\n";
+  outStream << "colConfidenceT [ " << _nColumns << "\n";
+  outStream.write((const char*)_colConfidenceT, _nColumns * sizeof(Real));
+  outStream << "\n]\n";
+  outStream << "colConfidenceT1 [ " << _nColumns << "\n";
+  outStream.write((const char*)_colConfidenceT1, _nColumns * sizeof(Real));
+  outStream << "\n]\n";
 
-  // Additions in version 2.
-  outStream << _segmentUpdates.size() << " ";
-  for (auto & elem : _segmentUpdates)
-  {
+
+  // Capture the Segments
+  outStream << "Segments " << _segmentUpdates.size() << "\n";
+  for (auto &elem : _segmentUpdates) {
     elem.save(outStream);
   }
+  outStream << "\n";
 
+  // Capture the Cells
+  outStream << "Cells " << _nCells << "\n";
   NTA_CHECK(_nCells == _cells.size());
   for (UInt i = 0; i != _nCells; ++i) {
     _cells[i].save(outStream);
     outStream << std::endl;
   }
+  outStream << "\n";
 
-  outStream << " out ";
+  outStream << "out " << std::endl;
 }
-
-//----------------------------------------------------------------------------
-/**
- * Save the state to the given file
- */
-void Cells4::saveToFile(std::string filePath) const
-{
-  OFStream outStream(filePath.c_str(), std::ios_base::out | std::ios_base::binary);
-  // Request std::ios_base::failure exception upon logical or physical i/o error
-  outStream.exceptions(std::ifstream::failbit | std::ifstream::badbit);
-
-  outStream.precision(std::numeric_limits<double>::digits10 + 1);
-  save(outStream);
-
-  // Explicitly close the stream so that we may get an exception on error
-  outStream.close();
-}
-
-//----------------------------------------------------------------------
-/**
- * Load the state from the given file
- */
-void Cells4::loadFromFile(std::string filePath)
-{
-  IFStream outStream(filePath.c_str(), std::ios_base::in | std::ios_base::binary);
-  load(outStream);
-}
-
-
 
 //------------------------------------------------------------------------------
 /**
  * Need to load and re-propagate activities so that we can really persist
  * at any point, load back and resume inference at exactly the same point.
+ *
+ * Note: Most parts are saved in binary format. The file
+ *       into which this is written must be opened in binary mode.
+ *       This also means that it must be restored on a machine
+ *       of the same architecture and compiled with same bitness.
  */
-void Cells4::load(std::istream& inStream)
-{
+void Cells4::load(std::istream &inStream) {
   std::string tag = "";
-  inStream >> tag;
-  // If the checkpoint starts with "cellsV4" then it is the original,
-  // otherwise the version is a UInt.
-  UInt v = 0;
-  std::stringstream ss;
-  if (tag != "cellsV4")
-  {
-    ss << tag;
-    ss >> v;
-  }
+  UInt v;
+  Size len;
+  struct serializedState_t self;
 
-  inStream >> _ownsMemory;
+  inStream >> tag;
+  NTA_CHECK(tag == "Cells4")
+      << "first field of Cells4 serialization is invalid: " << tag;
+
+  inStream >> v;
+  NTA_CHECK(v >= 3) << "The Cells4 deserialization can only handle version 3 "
+                       "or higher. Found: "
+                    << v;
+
+  inStream >> tag;
+  NTA_CHECK(tag == "self");
+  inStream >> len;
+  inStream.ignore(1);
+  inStream.read((char *)&self, len);
+
+  NTA_CHECK(self.nColumns > 0 && self.nCellsPerCol)
+      << "No columns or cellsPerCol defined.";
+
+  // Initialize Cells4 class
+  initialize(self.nColumns, self.nCellsPerCol, self.activationThreshold,
+             self.minThreshold, self.newSynapseCount,
+             self.segUpdateValidDuration, self.permInitial, self.permConnected,
+             self.permMax, self.permDec, self.permInc, self.globalDecay,
+             self.doPooling);
+  // Note: this will create the state buffers if Python has not
+  //       already provided buffers.
+
+  _nIterations = self.nIterations;
+  _nLrnIterations = self.nLrnIterations;
+  _initSegFreq = self.initSegFreq;
+  _pamLength = self.pamLength;
+  _maxInfBacktrack = self.maxInfBacktrack;
+  _maxLrnBacktrack = self.maxLrnBacktrack;
+  _maxSeqLength = self.maxSeqLength;
+  _learnedSeqLength = self.learnedSeqLength;
+  _avgLearnedSeqLength = self.avgLearnedSeqLength;
+  _maxAge = self.maxAge;
+  _verbosity = self.verbosity;
+  _maxSegmentsPerCell = self.maxSegmentsPerCell;
+  _maxSynapsesPerSegment = self.maxSynapsesPerSegment;
+  _checkSynapseConsistency = self.checkSynapseConsistency;
+  _avgInputDensity = self.avgInputDensity;
+  _pamCounter = self.pamCounter;
+  _resetCalled = self.resetCalled;
+
+  inStream.ignore(1);
   inStream >> _rng;
 
-  UInt nColumns = 0, nCellsPerCol = 0;
-  UInt nIterations = 0;
+  inStream >> tag;
+  NTA_CHECK(tag == "infActiveStateT");
+  inStream.ignore(1);
+  _infActiveStateT.load(inStream);
 
-  inStream >> nColumns >> nCellsPerCol;
+  inStream >> tag;
+  NTA_CHECK(tag == "infActiveStateT1");
+  inStream.ignore(1);
+  _infActiveStateT1.load(inStream);
 
-  inStream >> _activationThreshold
-           >> _minThreshold
-           >> _newSynapseCount
-           >> nIterations
-           >> _segUpdateValidDuration
-           >> _initSegFreq
-           >> _permInitial
-           >> _permConnected
-           >> _permMax
-           >> _permDec
-           >> _permInc
-           >> _globalDecay
-           >> _doPooling;
+  inStream >> tag;
+  NTA_CHECK(tag == "infPredictedStateT");
+  inStream.ignore(1);
+  _infPredictedStateT.load(inStream);
 
-  // TODO: clean up constructor/initialization and _segActivity below
-  initialize(nColumns, nCellsPerCol,
-             _activationThreshold,
-             _minThreshold,
-             _newSynapseCount,
-             _segUpdateValidDuration,
-             _permInitial,
-             _permConnected,
-             _permMax,
-             _permDec,
-             _permInc,
-             _globalDecay,
-             _doPooling,
-             _ownsMemory);
+  inStream >> tag;
+  NTA_CHECK(tag == "infPredictedStateT1");
+  inStream.ignore(1);
+  _infPredictedStateT1.load(inStream);
 
-  _nIterations = nIterations;
+  inStream >> tag;
+  NTA_CHECK(tag == "learnActiveStateT");
+  inStream.ignore(1);
+  _learnActiveStateT.load(inStream);
 
-  inStream  >> _maxInfBacktrack
-            >> _maxLrnBacktrack
-            >> _pamLength
-            >> _maxAge
-            >> _avgInputDensity
-            >> _pamCounter
-            >> _maxSeqLength
-            >> _avgLearnedSeqLength
-            >> _nLrnIterations
-            >> _maxSegmentsPerCell
-            >> _maxSynapsesPerSegment;
+  inStream >> tag;
+  NTA_CHECK(tag == "learnActiveStateT1");
+  inStream.ignore(1);
+  _learnActiveStateT1.load(inStream);
 
-  if (v >= 1)
-  {
-    inStream >> _learnedSeqLength
-             >> _verbosity
-             >> _checkSynapseConsistency
-             >> _resetCalled;
-    _learnActiveStateT.load(inStream);
-    _learnActiveStateT1.load(inStream);
-    _learnPredictedStateT.load(inStream);
-    _learnPredictedStateT1.load(inStream);
+  inStream >> tag;
+  NTA_CHECK(tag == "learnPredictedStateT");
+  inStream.ignore(1);
+  _learnPredictedStateT.load(inStream);
+
+  inStream >> tag;
+  NTA_CHECK(tag == "learnPredictedStateT1");
+  inStream.ignore(1);
+  _learnPredictedStateT1.load(inStream);
+
+  // restore the prev states (for backtracking)
+  // (these are deque's of vectors of UInt, see StlIo.hpp)
+  _prevInfPatterns.clear();
+  inStream >> tag;
+  NTA_CHECK(tag == "prevInfPatterns");
+  inStream >> tag;
+  NTA_CHECK(tag == "[");
+  inStream >> len;
+  for (size_t i = 0; i < len; i++) {
+    size_t count;
+    inStream >> count;
+    inStream.ignore(1);
+    std::vector<UInt> vec(count);
+    binary_load(inStream, vec);
+    _prevInfPatterns.push_back(vec);
+  }
+  inStream >> tag;
+  NTA_CHECK(tag == "]");
+
+  _prevLrnPatterns.clear();
+  inStream >> tag;
+  NTA_CHECK(tag == "prevLrnPatterns");
+  inStream >> tag;
+  NTA_CHECK(tag == "[");
+  inStream >> len;
+  for (size_t i = 0; i < len; i++) {
+    size_t count;
+    inStream >> count;
+    inStream.ignore(1);
+    std::vector<UInt> vec(count);
+    binary_load(inStream, vec);
+    _prevLrnPatterns.push_back(vec);
+  }
+  inStream >> tag;
+  NTA_CHECK(tag == "]");
+
+  inStream >> tag;
+  NTA_CHECK(tag == "cellConfidenceT");
+  inStream >> tag;
+  NTA_CHECK(tag == "[");
+  inStream >> len;
+  NTA_CHECK(len == _nCells);
+  inStream.ignore(1);
+  inStream.read((char *)_cellConfidenceT, _nCells * sizeof(Real));
+  inStream >> tag;
+  NTA_CHECK(tag == "]");
+
+
+  inStream >> tag;
+  NTA_CHECK(tag == "cellConfidenceT1");
+  inStream >> tag;
+  NTA_CHECK(tag == "[");
+  inStream >> len;
+  NTA_CHECK(len == _nCells);
+  inStream.ignore(1);
+  inStream.read((char *)_cellConfidenceT1, _nCells * sizeof(Real));
+  inStream >> tag;
+  NTA_CHECK(tag == "]");
+
+  inStream >> tag;
+  NTA_CHECK(tag == "colConfidenceT");
+  inStream >> tag;
+  NTA_CHECK(tag == "[");
+  inStream >> len;
+  NTA_CHECK(len == _nColumns);
+  inStream.ignore(1);
+  inStream.read((char *)_colConfidenceT, _nColumns* sizeof(Real));
+  inStream >> tag;
+  NTA_CHECK(tag == "]");
+
+  inStream >> tag;
+  NTA_CHECK(tag == "colConfidenceT1");
+  inStream >> tag;
+  NTA_CHECK(tag == "[");
+  inStream >> len;
+  NTA_CHECK(len == _nColumns);
+  inStream.ignore(1);
+  inStream.read((char *)_colConfidenceT1, _nColumns* sizeof(Real));
+  inStream >> tag;
+  NTA_CHECK(tag == "]");
+
+  _segmentUpdates.clear();
+  inStream >> tag;
+  NTA_CHECK(tag == "Segments");
+  inStream >> len;
+  inStream.ignore(1);
+  for (UInt i = 0; i < len; ++i) {
+    _segmentUpdates.push_back(SegmentUpdate());
+    _segmentUpdates[i].load(inStream);
   }
 
-  if (v >= 2)
-  {
-    UInt n;
-    _segmentUpdates.clear();
-    inStream >> n;
-    for (UInt i = 0; i < n; ++i)
-    {
-      _segmentUpdates.push_back(SegmentUpdate());
-      _segmentUpdates[i].load(inStream);
-    }
-  }
-
+  inStream >> tag;
+  NTA_CHECK(tag == "Cells");
+  inStream >> len;
+  NTA_CHECK(len == _nCells) << "Not the number of cells expected.";
+  inStream.ignore(1);
   for (UInt i = 0; i != _nCells; ++i) {
     _cells[i].load(inStream);
   }
 
-  std::string marker;
-  inStream >> marker;
-  NTA_CHECK(marker == "out");
+  inStream >> tag;
+  NTA_CHECK(tag == "out"); // at end of file.
 
   // Restore out synapses
   rebuildOutSynapses();
 
   // Check invariants for smaller networks or if explicitly requested
-  if (_checkSynapseConsistency || (_nCells * _maxSegmentsPerCell < 100000) )
-  {
-    NTA_CHECK(invariants(true));
-  }
+  NTA_CHECK(invariants(true));
 
   // Update the version after loading everything.
   _version = VERSION;
@@ -2149,8 +2237,7 @@ void Cells4::load(std::istream& inStream)
  * each time synapses/segments are created/deleted. This test takes some time
  * but it's indispensable in development.
  */
-bool Cells4::invariants(bool verbose) const
-{
+bool Cells4::invariants(bool verbose) const {
   using namespace std;
 
   set<string> back_map;
@@ -2176,14 +2263,14 @@ bool Cells4::invariants(bool verbose) const
     // Analyze InSynapses
     for (UInt j = 0; j != _cells[i].size(); ++j) {
 
-      const Segment& seg = _cells[i][j];
+      const Segment &seg = _cells[i][j];
 
       for (UInt k = 0; k != seg.size(); ++k) {
 
         stringstream buf;
         buf << i << '.' << j << '.' << seg[k].srcCellIdx();
 
-        if (is_in(buf.str(), back_map)) {
+        if (std::find(back_map.cbegin(), back_map.cend(), buf.str()) != back_map.cend() ) { //back_map contains buf
           std::cout << "\nDuplicate incoming synapse: " << std::endl;
           consistent = false;
         }
@@ -2197,12 +2284,12 @@ bool Cells4::invariants(bool verbose) const
     // Analyze OutSynapses
     for (UInt j = 0; j != _outSynapses[i].size(); ++j) {
 
-      const OutSynapse& syn = _outSynapses[i][j];
+      const OutSynapse &syn = _outSynapses[i][j];
 
       stringstream buf;
       buf << syn.dstCellIdx() << '.' << syn.dstSegIdx() << '.' << i;
 
-      if (is_in(buf.str(), forward_map)) {
+      if (std::find(forward_map.cbegin(), forward_map.cend(), buf.str()) != forward_map.cend() ) { //contains buf //TODO use set.contains(x) in c++20 
         std::cout << "\nDuplicate outgoing synapse:" << std::endl;
         consistent = false;
       }
@@ -2214,54 +2301,48 @@ bool Cells4::invariants(bool verbose) const
   consistent &= back_map == forward_map;
 
   if (!consistent) {
-    std::cout << "synapses inconsistent forward_map size="
-    << forward_map.size() << " back_map size="
-    << back_map.size() << std::endl;
-    //std::cout << "\nBack/forward maps: "
+    std::cout << "synapses inconsistent forward_map size=" << forward_map.size()
+              << " back_map size=" << back_map.size() << std::endl;
+    // std::cout << "\nBack/forward maps: "
     //     << back_map.size() << " " << forward_map.size() << std::endl;
-    //set<string>::iterator it1 = back_map.begin();
-    //set<string>::iterator it2 = forward_map.begin();
-    //while (it1 != back_map.end() && it2 != forward_map.end())
+    // set<string>::iterator it1 = back_map.begin();
+    // set<string>::iterator it2 = forward_map.begin();
+    // while (it1 != back_map.end() && it2 != forward_map.end())
     //  std::cout << *it1++ << " " << *it2++ << std::endl;
-    //while (it1 != back_map.end())
+    // while (it1 != back_map.end())
     //  std::cout << *it1++ << std::endl;
-    //while (it2 != forward_map.end())
+    // while (it2 != forward_map.end())
     //  std::cout << *it2++ << std::endl;
   } else {
-    //std::cout << "synapses consistent" << std::endl;
+    // std::cout << "synapses consistent" << std::endl;
   }
 
   return consistent;
 }
 
-
-
-void
-Cells4::addNewSegment(UInt colIdx, UInt cellIdxInCol,
-                      bool sequenceSegmentFlag,
-                      const std::vector<std::pair<UInt, UInt> >& extSynapses)
-{
+void Cells4::addNewSegment(
+    UInt colIdx, UInt cellIdxInCol, bool sequenceSegmentFlag,
+    const std::vector<std::pair<UInt, UInt>> &extSynapses) {
   NTA_ASSERT(colIdx < nColumns());
   NTA_ASSERT(cellIdxInCol < nCellsPerCol());
 
   UInt cellIdx = colIdx * _nCellsPerCol + cellIdxInCol;
 
   static std::vector<UInt> synapses;
-  synapses.resize(extSynapses.size());      // how many slots we need
+  synapses.resize(extSynapses.size()); // how many slots we need
   for (UInt i = 0; i != extSynapses.size(); ++i)
     synapses[i] = extSynapses[i].first * _nCellsPerCol + extSynapses[i].second;
 
-  SegmentUpdate update(cellIdx, (UInt) -1, sequenceSegmentFlag,
-                       _nLrnIterations, synapses);  // TODO: Add this for invariants check
+  SegmentUpdate update(cellIdx, (UInt)-1, sequenceSegmentFlag, _nLrnIterations,
+                       synapses); // TODO: Add this for invariants check
 
   _segmentUpdates.push_back(update);
 }
 
 //--------------------------------------------------------------------------------
-void
-Cells4::updateSegment(UInt colIdx, UInt cellIdxInCol, UInt segIdx,
-                      const std::vector<std::pair<UInt, UInt> >& extSynapses)
-{
+void Cells4::updateSegment(
+    UInt colIdx, UInt cellIdxInCol, UInt segIdx,
+    const std::vector<std::pair<UInt, UInt>> &extSynapses) {
   NTA_ASSERT(colIdx < nColumns());
   NTA_ASSERT(cellIdxInCol < nCellsPerCol());
 
@@ -2269,7 +2350,7 @@ Cells4::updateSegment(UInt colIdx, UInt cellIdxInCol, UInt segIdx,
   bool sequenceSegmentFlag = segment(cellIdx, segIdx).isSequenceSegment();
 
   static std::vector<UInt> synapses;
-  synapses.resize(extSynapses.size());      // how many slots we need
+  synapses.resize(extSynapses.size()); // how many slots we need
   for (UInt i = 0; i != extSynapses.size(); ++i)
     synapses[i] = extSynapses[i].first * _nCellsPerCol + extSynapses[i].second;
 
@@ -2283,47 +2364,40 @@ Cells4::updateSegment(UInt colIdx, UInt cellIdxInCol, UInt segIdx,
 /**
  * Simple helper function for allocating our numerous state variables
  */
-template <typename It> void allocateState(It *&state, const UInt numElmts)
-{
-  state  = new It [numElmts];
+template <typename It> void allocateState(It *&state, const UInt numElmts) {
+  if (state != nullptr)
+    delete[] state;
+  state = new It[numElmts];
   memset(state, 0, numElmts * sizeof(It));
 }
 
-void Cells4::setCellSegmentOrder(bool matchPythonOrder)
-{
+void Cells4::setCellSegmentOrder(bool matchPythonOrder) {
   Cell::setSegmentOrder(matchPythonOrder);
 }
 
-void
-Cells4::initialize(UInt nColumns,
-                   UInt nCellsPerCol,
-                   UInt activationThreshold,
-                   UInt minThreshold,
-                   UInt newSynapseCount,
-                   UInt segUpdateValidDuration,
-                   Real permInitial,
-                   Real permConnected,
-                   Real permMax,
-                   Real permDec,
-                   Real permInc,
-                   Real globalDecay,
-                   bool doPooling,
-                   bool initFromCpp,
-                   bool checkSynapseConsistency)
-{
-  _nColumns                   = nColumns;
-  _nCellsPerCol               = nCellsPerCol;
-  _nCells                     = nColumns * nCellsPerCol;
+void Cells4::initialize(UInt nColumns, UInt nCellsPerCol,
+                        UInt activationThreshold, UInt minThreshold,
+                        UInt newSynapseCount, UInt segUpdateValidDuration,
+                        Real permInitial, Real permConnected, Real permMax,
+                        Real permDec, Real permInc, Real globalDecay,
+                        bool doPooling, bool initFromCpp,
+                        bool checkSynapseConsistency) {
+  _nColumns = nColumns;
+  _nCellsPerCol = nCellsPerCol;
+  _nCells = nColumns * nCellsPerCol;
+  if (_nCells == 0)
+    return;
+
   NTA_CHECK(_nCells <= _MAX_CELLS);
 
-  _activationThreshold        = activationThreshold;
-  _minThreshold               = minThreshold;
-  _newSynapseCount            = newSynapseCount;
-  _segUpdateValidDuration     = segUpdateValidDuration;
+  _activationThreshold = activationThreshold;
+  _minThreshold = minThreshold;
+  _newSynapseCount = newSynapseCount;
+  _segUpdateValidDuration = segUpdateValidDuration;
 
-  _initSegFreq                = 0.5;
-  _permInitial                = permInitial;
-  _permConnected              = permConnected;
+  _initSegFreq = 0.5;
+  _permInitial = permInitial;
+  _permConnected = permConnected;
   _permMax = permMax;
   _permDec = permDec;
   _permInc = permInc;
@@ -2335,7 +2409,7 @@ Cells4::initialize(UInt nColumns,
 
   _nIterations = 0;
   _nLrnIterations = 0;
-  _pamCounter = _pamLength+1;
+  _pamCounter = _pamLength + 1;
   _maxInfBacktrack = 10;
   _maxLrnBacktrack = 5;
   _maxSeqLength = 0;
@@ -2355,19 +2429,26 @@ Cells4::initialize(UInt nColumns,
   // Python allocate numpy arrays and pass them to C++, or C++
   // allocate memory here (then Python gets pointers via
   // getStatePointers).
-  if (initFromCpp) {
-    _ownsMemory = true;
+  // Actually...we are going to ignore the 'initFromCpp' parameter.
+  //     At allocation of Cells4 we always allocate memory.
+  //     If Python wants to control the buffers, it
+  //     must call setStatePointers() after creating Cells4
+  //     and the previously allocated buffers are deleted.
+  //
+  //     When deserializing,
+  //      1) create Cells4 with 0 columns (the default).
+  //      2) call setStatePointers() if Python wants to control buffers.
+  //      3) call load()
+  //
+  if (_ownsMemory ) {
     _infActiveStateT.initialize(_nCells);
     _infActiveStateT1.initialize(_nCells);
     _infPredictedStateT.initialize(_nCells);
     _infPredictedStateT1.initialize(_nCells);
-    allocateState(_cellConfidenceT,         _nCells);
-    allocateState(_cellConfidenceT1,        _nCells);
-    allocateState(_colConfidenceT,          _nColumns);
-    allocateState(_colConfidenceT1,         _nColumns);
-  }
-  else {
-    _ownsMemory = false;
+    allocateState(_cellConfidenceT, _nCells);
+    allocateState(_cellConfidenceT1, _nCells);
+    allocateState(_colConfidenceT, _nColumns);
+    allocateState(_colConfidenceT1, _nColumns);
   }
 
   // Initialize the state variables that are always managed inside the class
@@ -2379,9 +2460,9 @@ Cells4::initialize(UInt nColumns,
   _infPredictedBackup.initialize(_nCells);
   _infActiveStateCandidate.initialize(_nCells);
   _infPredictedStateCandidate.initialize(_nCells);
-  allocateState(_cellConfidenceCandidate,     _nCells);
-  allocateState(_colConfidenceCandidate,      _nColumns);
-  allocateState(_tmpInputBuffer,              _nColumns);
+  allocateState(_cellConfidenceCandidate, _nCells);
+  allocateState(_colConfidenceCandidate, _nColumns);
+  allocateState(_tmpInputBuffer, _nColumns);
 
   // Internal timings and states used for optimization
   _nIterationsSinceRebalance = 0;
@@ -2389,67 +2470,55 @@ Cells4::initialize(UInt nColumns,
   _checkSynapseConsistency = checkSynapseConsistency;
   if (_checkSynapseConsistency)
     std::cout << "*** Synapse consistency checking turned on for Cells4 ***\n";
-
 }
 
-UInt Cells4::nSegments() const
-{
+UInt Cells4::nSegments() const {
   UInt n = 0;
   for (UInt i = 0; i != _nCells; ++i)
     n += _cells[i].nSegments();
   return n;
 }
 
-UInt Cells4::__nSegmentsOnCell(UInt cellIdx) const
-{
+UInt Cells4::__nSegmentsOnCell(UInt cellIdx) const {
   NTA_ASSERT(cellIdx < _nCells);
   return _cells[cellIdx].size();
 }
 
-UInt Cells4::nSegmentsOnCell(UInt colIdx, UInt cellIdxInCol) const
-{
+UInt Cells4::nSegmentsOnCell(UInt colIdx, UInt cellIdxInCol) const {
   NTA_ASSERT(colIdx < nColumns());
   NTA_ASSERT(cellIdxInCol < nCellsPerCol());
 
   return _cells[colIdx * nCellsPerCol() + cellIdxInCol].nSegments();
 }
 
-
-UInt Cells4::nSynapses() const
-{
+UInt Cells4::nSynapses() const {
   UInt n = 0;
   for (UInt i = 0; i != _nCells; ++i)
     n += _cells[i].nSynapses();
   return n;
 }
 
-
-UInt Cells4::nSynapsesInCell(UInt cellIdx) const
-{
+UInt Cells4::nSynapsesInCell(UInt cellIdx) const {
   NTA_ASSERT(cellIdx < nCells());
 
   return _cells[cellIdx].nSynapses();
 }
 
-Cell* Cells4::getCell(UInt colIdx, UInt cellIdxInCol)
-{
+Cell &Cells4::getCell(UInt colIdx, UInt cellIdxInCol) {
   NTA_ASSERT(colIdx < nColumns());
   NTA_ASSERT(cellIdxInCol < nCellsPerCol());
 
-  return & _cells[colIdx * _nCellsPerCol + cellIdxInCol];
+  return _cells[colIdx * _nCellsPerCol + cellIdxInCol];
 }
 
-UInt Cells4::getCellIdx(UInt colIdx, UInt cellIdxInCol)
-{
+UInt Cells4::getCellIdx(UInt colIdx, UInt cellIdxInCol) {
   NTA_ASSERT(colIdx < nColumns());
   NTA_ASSERT(cellIdxInCol < nCellsPerCol());
 
   return colIdx * _nCellsPerCol + cellIdxInCol;
 }
 
-Segment*
-Cells4::getSegment(UInt colIdx, UInt cellIdxInCol, UInt segIdx)
-{
+Segment &Cells4::getSegment(UInt colIdx, UInt cellIdxInCol, UInt segIdx) {
   NTA_ASSERT(colIdx < nColumns());
   NTA_ASSERT(cellIdxInCol < nCellsPerCol());
 
@@ -2457,22 +2526,17 @@ Cells4::getSegment(UInt colIdx, UInt cellIdxInCol, UInt segIdx)
 
   NTA_ASSERT(segIdx < _cells[cellIdx].size());
 
-  return & segment(cellIdx, segIdx);
+  return segment(cellIdx, segIdx);
 }
 
-
-Segment& Cells4::segment(UInt cellIdx, UInt segIdx)
-{
+Segment &Cells4::segment(UInt cellIdx, UInt segIdx) {
   NTA_ASSERT(cellIdx < nCells());
   NTA_ASSERT(segIdx < _cells[cellIdx].size());
 
   return _cells[cellIdx][segIdx];
 }
 
-
-std::vector<UInt>
-Cells4::getNonEmptySegList(UInt colIdx, UInt cellIdxInCol)
-{
+std::vector<UInt> Cells4::getNonEmptySegList(UInt colIdx, UInt cellIdxInCol) {
   NTA_ASSERT(colIdx < nColumns());
   NTA_ASSERT(cellIdxInCol < nCellsPerCol());
 
@@ -2485,83 +2549,82 @@ Cells4::getNonEmptySegList(UInt colIdx, UInt cellIdxInCol)
 /**
  * Find weakly activated cell in column.
  */
-std::pair<UInt, UInt> Cells4::getBestMatchingCellT(UInt colIdx, const CState& state, UInt minThreshold)
-{
-  {
-    NTA_ASSERT(colIdx < nColumns());
-  }
+std::pair<UInt, UInt> Cells4::getBestMatchingCellT(UInt colIdx,
+                                                   const CState &state,
+                                                   UInt minThreshold) {
+  { NTA_ASSERT(colIdx < nColumns()); }
 
-  int start = colIdx * _nCellsPerCol,
-      end   = start + _nCellsPerCol;
+  int start = colIdx * _nCellsPerCol, end = start + _nCellsPerCol;
   UInt best_cell = UInt(-1);
-  UInt best_seg  = UInt(-1);
+  UInt best_seg = UInt(-1);
   UInt best_activity = minThreshold > 0 ? minThreshold - 1 : 0;
 
   // For each cell in the column
-  for (int ii = end - 1; ii >= start; --ii) {    // reverse segment order to match Python logic
+  for (int ii = end - 1; ii >= start;
+       --ii) { // reverse segment order to match Python logic
     UInt i = UInt(ii);
 
     // Check synapse consistency for each segment if requested
     if (_checkSynapseConsistency) {
       for (UInt j = 0; j != _cells[i].size(); ++j) {
-        NTA_CHECK( segment(i,j).computeActivity(state, _permConnected, false) == _learnActivity.get(i, j) );
+        NTA_CHECK(segment(i, j).computeActivity(state, _permConnected, false) ==
+                  _learnActivity.get(i, j));
       }
     }
 
-    if (_learnActivity.get(i) > best_activity) { // if this cell may have a worthy segment
+    if (_learnActivity.get(i) >
+        best_activity) { // if this cell may have a worthy segment
 
       for (UInt j = 0; j != _cells[i].size(); ++j) {
 
         // Open: Does _cells[i].size() vary?
         UInt activity = _learnActivity.get(i, j);
 
-        if (best_activity < activity) {     // if a new maximum
-          best_activity = activity;         // set the new maximum
-          best_cell = i;                    // remember the cell
-          best_seg = j;                     // remember the segment
+        if (best_activity < activity) { // if a new maximum
+          best_activity = activity;     // set the new maximum
+          best_cell = i;                // remember the cell
+          best_seg = j;                 // remember the segment
         }
         if (_verbosity >= 6 && activity >= minThreshold) {
           std::cout << "getBestMatchingCell, learning on col=" << colIdx
                     << ", segment: ";
           _cells[i][j].print(std::cout, _nCellsPerCol);
           std::cout << "\n";
-          std::cout << "activity = " << activity << ", maxSegActivity = "
-                    << best_activity << "\n";
+          std::cout << "activity = " << activity
+                    << ", maxSegActivity = " << best_activity << "\n";
         }
       } // for each segment in cell
 
     } // if this cell may have a segment with a new maximum
-  } // for each cell in the column
+  }   // for each cell in the column
 
-  return std::make_pair(best_cell, best_seg);    // could be (-1,-1)
+  return std::make_pair(best_cell, best_seg); // could be (-1,-1)
 }
 
 //----------------------------------------------------------------------
 /**
  * Find weakly activated cell in column.
  */
-std::pair<UInt, UInt> Cells4::getBestMatchingCellT1(UInt colIdx, const CState& state, UInt minThreshold)
-{
-  {
-    NTA_ASSERT(colIdx < nColumns());
-  }
+std::pair<UInt, UInt> Cells4::getBestMatchingCellT1(UInt colIdx,
+                                                    const CState &state,
+                                                    UInt minThreshold) {
+  { NTA_ASSERT(colIdx < nColumns()); }
 
   UInt start = colIdx * _nCellsPerCol, end = start + _nCellsPerCol;
-  UInt best_cell = (UInt) -1;
-  std::pair<UInt, UInt> best((UInt) -1, minThreshold);
+  UInt best_cell = (UInt)-1;
+  std::pair<UInt, UInt> best((UInt)-1, minThreshold);
 
   // For each cell in column
   for (UInt i = start; i != end; ++i) {
 
     UInt maxSegActivity = 0, maxSegIdx = 0, activity = 0;
 
-
     for (UInt j = 0; j != _cells[i].size(); ++j) {
 
-      if (segment(i,j).empty())
+      if (segment(i, j).empty())
         continue;
 
-      activity = segment(i,j).computeActivity(state, _permConnected, false);
+      activity = segment(i, j).computeActivity(state, _permConnected, false);
 
       if (activity > maxSegActivity) {
         maxSegActivity = activity;
@@ -2572,8 +2635,8 @@ std::pair<UInt, UInt> Cells4::getBestMatchingCellT1(UInt colIdx, const CState& s
                   << ", segment: ";
         _cells[i][j].print(std::cout, _nCellsPerCol);
         std::cout << "\n";
-        std::cout << "activity = " << activity << ", maxSegActivity = "
-                  << maxSegActivity << "\n";
+        std::cout << "activity = " << activity
+                  << ", maxSegActivity = " << maxSegActivity << "\n";
       }
     } // for each segment in cell
 
@@ -2585,84 +2648,78 @@ std::pair<UInt, UInt> Cells4::getBestMatchingCellT1(UInt colIdx, const CState& s
 
   } // for each cell in column
 
-  if (best_cell != (UInt) -1)
+  if (best_cell != (UInt)-1)
     return std::make_pair(best_cell, best.first);
   else
-    return std::make_pair((UInt) -1, (UInt) -1);
+    return std::make_pair((UInt)-1, (UInt)-1);
 }
 
-void
-Cells4::chooseCellsToLearnFrom(UInt cellIdx, UInt segIdx,
-                               UInt nSynToAdd, CStateIndexed& state,
-                               std::vector<UInt>& srcCells)
-{
+void Cells4::chooseCellsToLearnFrom(UInt cellIdx, UInt segIdx, UInt nSynToAdd,
+                                    CStateIndexed &state,
+                                    std::vector<UInt> &srcCells) {
   // bail out if no cells requested
   if (nSynToAdd == 0)
     return;
   TIMER(chooseCellsTimer.start());
 
-  // start with a sorted vector of all the cells that are on in the current state
+  // start with a sorted vector of all the cells that are on in the current
+  // state
   static std::vector<UInt> vecCellBuffer;
   vecCellBuffer = state.cellsOn(true);
 
   // remove any cells already in this segment
   static std::vector<UInt> vecPruned;
-  if (segIdx != (UInt) -1) {
+  if (segIdx != (UInt)-1) {
 
     // collect the sorted list of source cell indices
     Segment segThis = _cells[cellIdx][segIdx];
     static std::vector<UInt> vecAlreadyHave;
     if (vecAlreadyHave.capacity() < segThis.size())
       vecAlreadyHave.reserve(segThis.size());
-    vecAlreadyHave.clear();                 // purge residual data
+    vecAlreadyHave.clear(); // purge residual data
     for (UInt i = 0; i != segThis.size(); ++i)
       vecAlreadyHave.push_back(segThis[i].srcCellIdx());
 
     // remove any of these found in vecCellBuffer
-    if (vecPruned.size() < vecCellBuffer.size())   // ensure there is enough room for the results
+    if (vecPruned.size() <
+        vecCellBuffer.size()) // ensure there is enough room for the results
       vecPruned.resize(vecCellBuffer.size());
     std::vector<UInt>::iterator iterPruned;
-    iterPruned = std::set_difference(vecCellBuffer.begin(),
-                                     vecCellBuffer.end(),
+    iterPruned = std::set_difference(vecCellBuffer.begin(), vecCellBuffer.end(),
                                      vecAlreadyHave.begin(),
-                                     vecAlreadyHave.end(),
-                                     vecPruned.begin());
+                                     vecAlreadyHave.end(), vecPruned.begin());
     vecPruned.resize(iterPruned - vecPruned.begin());
-  }
-  else {
+  } else {
     vecPruned = vecCellBuffer;
   }
-  const UInt nbrCells = vecPruned.size();
+  const UInt nbrCells = (UInt)vecPruned.size();
 
   // bail out if there are no cells left to process
   if (nbrCells == 0) {
-    TIMER(chooseCellsTimer.stop());         // turn off timer
+    TIMER(chooseCellsTimer.stop()); // turn off timer
     return;
   }
 
   // if we found fewer cells than requested, return all of them
   // The new ones are sorted, but we need to sort again if there were
   // any old ones.
-  bool fSortNeeded = !srcCells.empty();   // may be overridden below
+  bool fSortNeeded = !srcCells.empty(); // may be overridden below
   if (nbrCells <= nSynToAdd) {
     // since we use all of vecPruned, we don't need a random number
     srcCells.reserve(nbrCells + srcCells.size());
     std::vector<UInt>::iterator iterCellBuffer;
-    for (iterCellBuffer = vecPruned.begin(); iterCellBuffer != vecPruned.end(); ++iterCellBuffer) {
+    for (iterCellBuffer = vecPruned.begin(); iterCellBuffer != vecPruned.end();
+         ++iterCellBuffer) {
       srcCells.push_back(*iterCellBuffer);
     }
-  }
-  else if (nSynToAdd == 1) {
+  } else if (nSynToAdd == 1) {
     // if just one cell requested, choose one at random
     srcCells.push_back(vecPruned[_rng.getUInt32(nbrCells)]);
-  }
-  else {
+  } else {
     // choose a random subset of the cells found, and append them to the
     // caller's array
-    UInt start = srcCells.size();
-    srcCells.resize(srcCells.size() + nSynToAdd);
-    _rng.sample(&vecPruned.front(), vecPruned.size(),
-                &srcCells[start], nSynToAdd);
+    auto add = _rng.sample<UInt>(vecPruned, nSynToAdd);
+    srcCells.insert(srcCells.begin(), add.begin(), add.end());
 
     fSortNeeded = true;
   }
@@ -2675,10 +2732,8 @@ Cells4::chooseCellsToLearnFrom(UInt cellIdx, UInt segIdx,
   TIMER(chooseCellsTimer.stop());
 }
 
-
 std::pair<UInt, UInt> Cells4::trimSegments(Real minPermanence,
-                                           UInt minNumSyns)
-{
+                                           UInt minNumSyns) {
   UInt nSegsRemoved = 0, nSynsRemoved = 0;
 
   // Fill in defaults
@@ -2691,13 +2746,11 @@ std::pair<UInt, UInt> Cells4::trimSegments(Real minPermanence,
     for (UInt segIdx = 0; segIdx != _cells[cellIdx].size(); ++segIdx) {
 
       static std::vector<UInt> removedSynapses;
-      removedSynapses.clear();              // purge residual data
+      removedSynapses.clear(); // purge residual data
 
-      Segment& seg = segment(cellIdx, segIdx);
+      Segment &seg = segment(cellIdx, segIdx);
 
-      seg.decaySynapses(minPermanence,
-                        removedSynapses,
-                        minPermanence, false);
+      seg.decaySynapses(minPermanence, removedSynapses, minPermanence, false);
 
       if (seg.size() < minNumSyns) {
 
@@ -2707,13 +2760,13 @@ std::pair<UInt, UInt> Cells4::trimSegments(Real minPermanence,
         eraseOutSynapses(cellIdx, segIdx, removedSynapses);
         _cells[cellIdx].releaseSegment(segIdx);
 
-        ++ nSegsRemoved;
+        ++nSegsRemoved;
 
       } else {
         eraseOutSynapses(cellIdx, segIdx, removedSynapses);
       }
 
-      nSynsRemoved += removedSynapses.size();
+      nSynsRemoved += (UInt)removedSynapses.size();
     }
   }
 
@@ -2728,8 +2781,7 @@ std::pair<UInt, UInt> Cells4::trimSegments(Real minPermanence,
 // Debugging helpers
 //----------------------------------------------------------------------
 
-void Cells4::printState(UInt *state)
-{
+void Cells4::printState(UInt *state) {
   for (UInt i = 0; i != nCellsPerCol(); ++i) {
     for (UInt c = 0; c != nColumns(); ++c) {
       if (c > 0 && c % 10 == 0)
@@ -2741,8 +2793,7 @@ void Cells4::printState(UInt *state)
   }
 }
 
-void Cells4::printStates()
-{
+void Cells4::printStates() {
   // Print out active state for debugging
   if (true) {
     std::cout << "TP10X: Active  T-1      \t T\n";
@@ -2804,31 +2855,36 @@ void Cells4::printStates()
   }
 }
 
-void Cells4::dumpSegmentUpdates()
-{
+void Cells4::printConfidence(Real *confidence, size_t len) const {
+  std::cout << "[ ";
+  for (size_t i = 0; i < len; i++) {
+    std::cout << confidence[i] << " ";
+  }
+  std::cout << "]\n";
+}
+
+
+void Cells4::dumpSegmentUpdates() {
   std::cout << _segmentUpdates.size() << " updates" << std::endl;
   for (UInt i = 0; i != _segmentUpdates.size(); ++i) {
-    _segmentUpdates[i].print(std::cout, true);
+    _segmentUpdates[i].print(std::cout, true, nCellsPerCol()); 
     std::cout << std::endl;
   }
 }
 
 // Print input pattern queue
-void Cells4::dumpPrevPatterns(std::deque<std::vector<UInt> > &patterns)
-{
+void Cells4::dumpPrevPatterns(std::deque<std::vector<UInt>> &patterns) {
   for (UInt p = 0; p < patterns.size(); p++) {
     std::cout << "Pattern " << p << ": ";
-    for (auto & elem : patterns[p]) {
+    for (auto &elem : patterns[p]) {
       std::cout << elem << " ";
     }
     std::cout << std::endl;
   }
   std::cout << std::endl;
-
 }
 
-void Cells4::print(std::ostream& outStream) const
-{
+void Cells4::print(std::ostream &outStream) const {
   for (UInt i = 0; i != _nCells; ++i) {
     std::cout << "Cell #" << i << " ";
     for (UInt j = 0; j != _cells[i].size(); ++j) {
@@ -2838,10 +2894,97 @@ void Cells4::print(std::ostream& outStream) const
   }
 }
 
-std::ostream& operator<<(std::ostream& outStream, const Cells4& cells)
-{
-  cells.print(outStream);
+std::ostream &Cells4::operator<<(std::ostream &outStream) {
+  print(outStream);
   return outStream;
+}
+
+bool Cells4::operator==(const Cells4 &other) const {
+
+  if (_activationThreshold != other._activationThreshold ||
+      _avgInputDensity != other._avgInputDensity ||
+      _avgLearnedSeqLength != other._avgLearnedSeqLength ||
+      _checkSynapseConsistency != other._checkSynapseConsistency ||
+      _doPooling != other._doPooling || 
+      _globalDecay != other._globalDecay ||
+      _initSegFreq != other._initSegFreq ||
+      _learnedSeqLength != other._learnedSeqLength ||
+      _maxAge != other._maxAge || 
+      _maxInfBacktrack != other._maxInfBacktrack ||
+      _maxLrnBacktrack != other._maxLrnBacktrack ||
+      _maxSegmentsPerCell != other._maxSegmentsPerCell ||
+      _maxSeqLength != other._maxSeqLength ||
+      _maxSynapsesPerSegment != other._maxSynapsesPerSegment ||
+      _minThreshold != other._minThreshold || 
+      _nCells != other._nCells ||
+      _nCellsPerCol != other._nCellsPerCol || 
+      _nColumns != other._nColumns ||
+      _newSynapseCount != other._newSynapseCount ||
+      _nIterations != other._nIterations ||
+      _nLrnIterations != other._nLrnIterations ||
+//!      _ownsMemory != other._ownsMemory || //who owns memory (py, cpp, ..) is not part of equals, as we want
+//to compare C++ and Py Cells objects 
+      _pamCounter != other._pamCounter ||
+      _pamLength != other._pamLength ||
+      _permConnected != other._permConnected || 
+      _permDec != other._permDec ||
+      _permInc != other._permInc || 
+      _permInitial != other._permInitial ||
+      _permMax != other._permMax || 
+      _resetCalled != other._resetCalled ||
+      _segUpdateValidDuration != other._segUpdateValidDuration ||
+      _verbosity != other._verbosity || 
+      _version != other._version) {
+    return false;
+  }
+  if (_rng != other._rng) {
+    return false;
+  }
+  if (_cells != other._cells) {
+    return false;
+  }
+  if (_segmentUpdates != other._segmentUpdates) {
+    return false;
+  }
+
+        // states
+      if (!_infActiveStateT.equals(other._infActiveStateT)) return false;
+      if (!_infActiveStateT1.equals(other._infActiveStateT1)) return false;
+      if (!_infPredictedStateT.equals(other._infPredictedStateT)) return false;
+      if (!_infPredictedStateT1.equals(other._infPredictedStateT1)) return false;
+      if (!_learnActiveStateT.equals(other._learnActiveStateT)) return false;
+      if (!_learnActiveStateT1.equals(other._learnActiveStateT1)) return false;
+      if (!_learnPredictedStateT.equals(other._learnPredictedStateT)) return false;
+      if (!_learnPredictedStateT1.equals(other._learnPredictedStateT1)) return false;
+
+  if (_prevInfPatterns != other._prevInfPatterns) {
+    return false;
+  }
+  if (_prevLrnPatterns != other._prevLrnPatterns) {
+    return false;
+  }
+  if (_nCells > 0) {
+    if (memcmp(_cellConfidenceT, other._cellConfidenceT,
+               _nCells * sizeof(Real)) != 0) {
+      return false;
+    }
+    if (memcmp(_cellConfidenceT1, other._cellConfidenceT1,
+               _nCells * sizeof(Real)) != 0) {
+      return false;
+    }
+  }
+  if (_nColumns > 0) {
+    if (memcmp(_colConfidenceT, other._colConfidenceT,
+               _nColumns * sizeof(Real)) != 0) {
+      return false;
+    }
+    if (memcmp(_colConfidenceT1, other._colConfidenceT1,
+               _nColumns * sizeof(Real)) != 0) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 //----------------------------------------------------------------------
@@ -2849,8 +2992,7 @@ std::ostream& operator<<(std::ostream& outStream, const Cells4& cells)
  * Compute cell and segment activities using forward propagation
  * and the given state variable.
  */
-void Cells4::computeForwardPropagation(CStateIndexed& state)
-{
+void Cells4::computeForwardPropagation(CStateIndexed &state) {
   // Zero out previous values
   // Using memset is quite a bit faster on laptops, but has almost no effect
   // on Neo15!
@@ -2861,11 +3003,12 @@ void Cells4::computeForwardPropagation(CStateIndexed& state)
   // activity coming into a cell.
 
   // process all cells that are on in the current state
-  static std::vector<UInt> vecCellBuffer ;
+  static std::vector<UInt> vecCellBuffer;
   vecCellBuffer = state.cellsOn();
   std::vector<UInt>::iterator iterCellBuffer;
-  for (iterCellBuffer = vecCellBuffer.begin(); iterCellBuffer != vecCellBuffer.end(); ++iterCellBuffer) {
-    std::vector< OutSynapse >& os = _outSynapses[*iterCellBuffer];
+  for (iterCellBuffer = vecCellBuffer.begin();
+       iterCellBuffer != vecCellBuffer.end(); ++iterCellBuffer) {
+    std::vector<OutSynapse> &os = _outSynapses[*iterCellBuffer];
     for (UInt j = 0; j != os.size(); ++j) {
       UInt dstCellIdx = os[j].dstCellIdx();
       UInt dstSegIdx = os[j].dstSegIdx();
@@ -2886,8 +3029,7 @@ void Cells4::computeForwardPropagation(CStateIndexed& state)
  * to move all state array modifications from Python to C++.  One
  * known offender is TP.py.
  */
-void Cells4::computeForwardPropagation(CState& state)
-{
+void Cells4::computeForwardPropagation(CState &state) {
   // Zero out previous values
   // Using memset is quite a bit faster on laptops, but has almost no effect
   // on Neo15!
@@ -2896,78 +3038,29 @@ void Cells4::computeForwardPropagation(CState& state)
   // Compute cell and segment activity by following forward propagation
   // links from each source cell.  _cellActivity will be set to the total
   // activity coming into a cell.
-#ifdef NTA_ARCH_64
-  const UInt multipleOf8 = 8 * (_nCells/8);
-  UInt i;
-  for (i = 0; i < multipleOf8; i += 8) {
-    UInt64 eightStates = * (UInt64 *)(state.arrayPtr() + i);
-    for (int k = 0; eightStates != 0  &&  k < 8; eightStates >>= 8, k++) {
-      if ((eightStates & 0xff) != 0) {
-        std::vector< OutSynapse >& os = _outSynapses[i + k];
-        for (UInt j = 0; j != os.size(); ++j) {
-          UInt dstCellIdx = os[j].dstCellIdx();
-          UInt dstSegIdx = os[j].dstSegIdx();
-          _inferActivity.increment(dstCellIdx, dstSegIdx);
-        }
-      }
-    }
-  }
-
-  // process the tail if (_nCells % 8) != 0
-  for (i = multipleOf8; i < _nCells; i++) {
+  for (UInt i = 0; i < _nCells; i++) {
     if (state.isSet(i)) {
-      std::vector< OutSynapse >& os = _outSynapses[i];
-      for (UInt j = 0; j != os.size(); ++j) {
-        UInt dstCellIdx = os[j].dstCellIdx();
-        UInt dstSegIdx = os[j].dstSegIdx();
+      const std::vector<OutSynapse> &os = _outSynapses[i];
+      for (auto outSyn : os) {
+        const UInt dstCellIdx = outSyn.dstCellIdx();
+        const UInt dstSegIdx = outSyn.dstSegIdx();
         _inferActivity.increment(dstCellIdx, dstSegIdx);
       }
     }
   }
-#else
-  const UInt multipleOf4 = 4 * (_nCells/4);
-  UInt i;
-  for (i = 0; i < multipleOf4; i += 4) {
-    UInt32 fourStates = * (UInt32 *)(state.arrayPtr() + i);
-    for (int k = 0; fourStates != 0  &&  k < 4; fourStates >>= 8, k++) {
-      if ((fourStates & 0xff) != 0) {
-        std::vector< OutSynapse >& os = _outSynapses[i + k];
-        for (UInt j = 0; j != os.size(); ++j) {
-          UInt dstCellIdx = os[j].dstCellIdx();
-          UInt dstSegIdx = os[j].dstSegIdx();
-          _inferActivity.increment(dstCellIdx, dstSegIdx);
-        }
-      }
-    }
-  }
-
-  // process the tail if (_nCells % 4) != 0
-  for (i = multipleOf4; i < _nCells; i++) {
-    if (state.isSet(i)) {
-      std::vector< OutSynapse >& os = _outSynapses[i];
-      for (UInt j = 0; j != os.size(); ++j) {
-        UInt dstCellIdx = os[j].dstCellIdx();
-        UInt dstSegIdx = os[j].dstSegIdx();
-        _inferActivity.increment(dstCellIdx, dstSegIdx);
-      }
-    }
-  }
-#endif // NTA_ARCH_32/64
 }
-#endif  // SOME_STATES_NOT_INDEXED
-
+#endif // SOME_STATES_NOT_INDEXED
 
 //--------------------------------------------------------------------------------
 // Dump detailed Cells4 timing report to stdout
 //--------------------------------------------------------------------------------
-void Cells4::dumpTiming()
-{
+void Cells4::dumpTiming() {
 #ifdef CELLS4_TIMING
   Real64 learnTime = learningTimer.getElapsed(),
          inferenceTime = inferenceTimer.getElapsed();
 
-  std::cout << "Total time in compute:   " << computeTimer.toString()   << "\n";
-  std::cout << "Total time in learning:  " << learningTimer.toString()  << "\n";
+  std::cout << "Total time in compute:   " << computeTimer.toString() << "\n";
+  std::cout << "Total time in learning:  " << learningTimer.toString() << "\n";
   std::cout << "Total time in inference: " << inferenceTimer.toString() << "\n";
 
   std::cout << "\n\nLearning breakdown:" << std::endl;
@@ -2990,9 +3083,8 @@ void Cells4::dumpTiming()
             << std::setprecision(3)
             << 100.0 * chooseCellsTimer.getElapsed() / learnTime << "%\n";
   std::cout << "adaptSegment: " << adaptSegmentTimer.toString() << " "
-                                << std::setprecision(3)
-                                << 100.0 * adaptSegmentTimer.getElapsed() / learnTime
-                                << "%\n";
+            << std::setprecision(3)
+            << 100.0 * adaptSegmentTimer.getElapsed() / learnTime << "%\n";
   std::cout << "Note: % is percentage of learning time\n";
 
   std::cout << "\n\nInference breakdown:" << std::endl;
@@ -3007,7 +3099,8 @@ void Cells4::dumpTiming()
             << 100.0 * infBacktrackTimer.getElapsed() / inferenceTime << "%\n";
   std::cout << "Forward prop: " << forwardInfPropTimer.toString() << " "
             << std::setprecision(3)
-            << 100.0 * forwardInfPropTimer.getElapsed() / inferenceTime << "%\n";
+            << 100.0 * forwardInfPropTimer.getElapsed() / inferenceTime
+            << "%\n";
   std::cout << "Note: % is percentage of inference time\n";
 
 #endif
@@ -3016,8 +3109,7 @@ void Cells4::dumpTiming()
 //--------------------------------------------------------------------------------
 // Reset timers and counters to 0
 //--------------------------------------------------------------------------------
-void Cells4::resetTimers()
-{
+void Cells4::resetTimers() {
 #ifdef CELLS4_TIMING
   computeTimer.reset();
   inferenceTimer.reset();

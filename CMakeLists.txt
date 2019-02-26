@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # Numenta Platform for Intelligent Computing (NuPIC)
-# Copyright (C) 2015-2017, Numenta, Inc.  Unless you have purchased from
+# Copyright (C) 2015-2018, Numenta, Inc.  Unless you have purchased from
 # Numenta, Inc. a separate commercial license for this software code, the
 # following terms and conditions apply:
 #
@@ -19,68 +19,74 @@
 # http://numenta.org/licenses/
 # -----------------------------------------------------------------------------
 
-cmake_minimum_required(VERSION 2.8)
-project(nupic_core_main CXX)
+cmake_minimum_required(VERSION 3.7)
+project(nupic_core CXX)
 
 set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}")
-
 set(CMAKE_VERBOSE_MAKEFILE OFF)
-
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 get_filename_component(REPOSITORY_DIR ${PROJECT_SOURCE_DIR} ABSOLUTE)
-
-if( POLICY CMP0046 )
-  cmake_policy(VERSION 2.8)
-  # The new policy for add_dependencies is to now error if a dependency target
-  # is not found. The old policy didn't care and continued through configuration
-  cmake_policy(SET CMP0046 OLD)
-endif()
-
-if( POLICY CMP0054 )
-  # The OLD behavior for this policy is to dereference variables and interpret
-  # keywords even if they are quoted or bracketed. The NEW behavior is to not
-  # dereference variables or interpret keywords that have been quoted or bracketed.
-  cmake_policy(SET CMP0054 OLD)
-endif()
-
+set($ENV{NUPIC_CPP} ${REPOSITORY_DIR})
 
 #
 # Global NuPIC CMake options
 #
-option(NUPIC_BUILD_PYEXT_MODULES
-       "Turn on building of python extension modules for nupic.bindings; turn off to build only static nupic_core lib with full symbol visibility."
-       ON)
+option(FORCE_CPP11 "Force compiler to use C++11 standard." OFF)
+option(FORCE_BOOST "Force compiler to install and use Boost." OFF)
+set(BINDING_BUILD "none" CACHE STRING "Specify the Binding to build 'Python2','Python3' or 'none', default 'none'." )
+# Note: by setting the CXX environment variable, a non-default c++ compiler can be specified.
 
-message(STATUS "NUPIC_BUILD_PYEXT_MODULES = ${NUPIC_BUILD_PYEXT_MODULES}")
-message(STATUS "PY_EXTENSIONS_DIR         = ${PY_EXTENSIONS_DIR}")
-
-message(STATUS "CMAKE_CXX_COMPILER_ID = ${CMAKE_CXX_COMPILER_ID}")
-message(STATUS "CMAKE_C_COMPILER      = ${CMAKE_C_COMPILER}")
-message(STATUS "CMAKE_CXX_COMPILER    = ${CMAKE_CXX_COMPILER}")
-message(STATUS "CMAKE_BUILD_TYPE      = ${CMAKE_BUILD_TYPE}")
-message(STATUS "CMAKE_INSTALL_PREFIX  = ${CMAKE_INSTALL_PREFIX}")
-
-
-# Identify platform name.
-string(TOLOWER ${CMAKE_SYSTEM_NAME} PLATFORM)
-
-# Define a platform suffix, eg ${PLATFORM}${BITNESS}${PLATFORM_SUFFIX}
-if (MSYS OR MINGW)
-  set(PLATFORM_SUFFIX -gcc)
+if(MSVC AND BINDING_BUILD STREQUAL "Python2")
+  message(FATAL_ERROR "The Extension library cannot be built for Python 2 using MSVC.  Use Python 3.x")
 endif()
 
+if(NOT CMAKE_BUILD_TYPE)
+	set(CMAKE_BUILD_TYPE Release)
+endif()
 
-# Make sure we can link against any specified paths.
-include_directories(SYSTEM ${CMAKE_INCLUDE_PATH})
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+   set(CMAKE_INSTALL_PREFIX "${PROJECT_SOURCE_DIR}/build/${CMAKE_BUILD_TYPE}" CACHE PATH "Default Install location" FORCE)
+endif(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
 
-set(EP_BASE ${CMAKE_BINARY_DIR}/ThirdParty)
+message(STATUS "REPOSITORY_DIR       = ${REPOSITORY_DIR}")
+message(STATUS "CMAKE_BINARY_DIR     = ${CMAKE_BINARY_DIR}")
+message(STATUS "CMAKE_BUILD_TYPE     = ${CMAKE_BUILD_TYPE}")
+message(STATUS "CMAKE_INSTALL_PREFIX = ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "FORCE_CPP11          = ${FORCE_CPP11}")
+message(STATUS "FORCE_BOOST          = ${FORCE_BOOST}")
+message(STATUS "BINDING_BUILD        = ${BINDING_BUILD}")
+message(STATUS "Environment var CXX  = $ENV{CXX}")
+message("")
 
 # Determine common toolchain settings, compiler and link flags
 include(CommonCompilerConfig)
 
+message(STATUS "CMAKE_CXX_COMPILER_ID= ${CMAKE_CXX_COMPILER_ID}")
+message(STATUS "CMAKE_CXX_COMPILER_VERSION=${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "CMAKE_CXX_COMPILER   = ${CMAKE_CXX_COMPILER}")
+message(STATUS "CMAKE_CXX_STANDARD   = ${CMAKE_CXX_STANDARD}")
+message(STATUS "PLATFORM             = ${PLATFORM}")
+message(STATUS "BITNESS              = ${BITNESS}")
+message(STATUS "NEEDS_BOOST          = ${NEEDS_BOOST}")
+message(STATUS "INTERNAL_CXX_FLAGS   = ${INTERNAL_CXX_FLAGS}")
+message(STATUS "INTERNAL_LINKER_FLAGS= ${INTERNAL_LINKER_FLAGS}")
+message(STATUS "COMMON_COMPILER_DEFINITIONS_STR=${COMMON_COMPILER_DEFINITIONS_STR}")
+message(STATUS "COMMON_OS_LIBS       = ${COMMON_OS_LIBS}")
+
 # Set up builds of external dependencies and get their exports.
 # (see individual external/*.cmake modules for exported settings and functions)
-add_subdirectory(external)
-include_directories(SYSTEM ${EXTERNAL_INCLUDE_DIRS})
-
+include(external/bootstrap.cmake)
+ 
 # Now build nupic_core project.
+set(core_library   nupic_core)
+if(MSVC)
+    set(src_lib_shared)
+else()
+    set(src_lib_shared nupic_core_shared)
+endif()
 add_subdirectory(src)
+
+string(REGEX MATCH "Python" match ${BINDING_BUILD})
+if(match)
+  add_subdirectory(bindings/py/cpp_src)
+endif()

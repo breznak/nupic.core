@@ -20,195 +20,128 @@
  * ---------------------------------------------------------------------
  */
 
-
-/** @file 
+/** @file
  * Generic OS Implementations for the OS class
  */
 
 #include <nupic/os/Timer.hpp>
+
+#include <nupic/utils/Random.hpp>
+#include <nupic/utils/Log.hpp>
+#include <algorithm> //max
+#include <cmath> //for sins
 #include <sstream>
+#include <vector>
 
-// Define a couple of platform-specific helper functions
+namespace nupic {
 
-#if defined(NTA_OS_WINDOWS)
+Timer::Timer(bool startme) {
+  nstarts_ = 0;
+  start_ = 0;
+  prevElapsed_ = 0;
 
-#include <windows.h>
-static nupic::UInt64 ticksPerSec_ = 0;
-static nupic::UInt64 initialTicks_ = 0;
-
-// initTime is called by the constructor, so it will always
-// have been called by the time we call getTicksPerSec or getCurrentTime
-static inline void initTime()
-{
-  if (initialTicks_ == 0)
-  {
-    LARGE_INTEGER f;
-    QueryPerformanceCounter(&f);
-    initialTicks_ = (nupic::UInt64)(f.QuadPart);
-
-    QueryPerformanceFrequency(&f);
-    ticksPerSec_ = (nupic::UInt64)(f.QuadPart);
-  }
-}
-
-static inline nupic::UInt64 getTicksPerSec()
-{
-  return ticksPerSec_;
+  reset();
+  if (startme)
+    start();
 }
 
 
-static nupic::UInt64 getCurrentTime()
-{
-  LARGE_INTEGER v;
-  QueryPerformanceCounter(&v);
-  return (nupic::UInt64)(v.QuadPart) - initialTicks_;
-}
-
-#elif defined(NTA_OS_DARWIN)
-
-// This include defines a UInt64 type that conflicts with the nupic::UInt64 type.
-// Because of this, all UInt64 is explicitly qualified in the interface. 
-#include <CoreServices/CoreServices.h>
-#include <mach/mach.h>
-#include <mach/mach_time.h>
-#include <unistd.h>
-
-// must be linked with -framework CoreServices
-
-static uint64_t initialTicks_ = 0;
-static nupic::UInt64 ticksPerSec_ = 0;
-
-static inline void initTime()
-{
-  if (initialTicks_ == 0)
-    initialTicks_ = mach_absolute_time();
-  if (ticksPerSec_ == 0)
-  {
-    mach_timebase_info_data_t sTimebaseInfo;
-    mach_timebase_info(&sTimebaseInfo);
-    ticksPerSec_ = (nupic::UInt64)(1e9 * (uint64_t)sTimebaseInfo.denom /
-        (uint64_t)sTimebaseInfo.numer);
-  }
-}
-
-static inline nupic::UInt64 getCurrentTime()
-{
-  return (nupic::UInt64)(mach_absolute_time() - initialTicks_);
-}
-
-static inline nupic::UInt64 getTicksPerSec()
-{
-  return ticksPerSec_;
+void Timer::start() {
+	if (!started_) {
+	  start_time_ = my_clock::now();
+	  nstarts_++;
+	  started_ = true;
+	}
 }
 
 
-#else
-// linux
-#include <sys/time.h>
+/**
+* Stop the stopwatch. When restarted, time will accumulate
+*/
+void Timer::stop() {
+    // stop the stopwatch
+	if (started_)
+	{
+	    const auto diff = my_clock::now() - start_time_;
+	    const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(diff);
 
-static nupic::UInt64 initialTicks_ = 0;
+	    prevElapsed_ += nanoseconds.count();
 
-static inline void initTime()
-{
-  if (initialTicks_ == 0)
-  {
-    struct timeval t;
-    ::gettimeofday(&t, nullptr);
-    initialTicks_ = nupic::UInt64((t.tv_sec * 1e6) + t.tv_usec);
-  }
-}
-
-static inline nupic::UInt64 getCurrentTime()
-{
-  struct timeval t;
-  ::gettimeofday(&t, nullptr);
-  nupic::UInt64 ticks = nupic::UInt64((t.tv_sec * 1e6) + t.tv_usec);
-  return ticks - initialTicks_;
+	    started_ = false;
+	}
 }
 
 
+/* In seconds, msec resolution */
+Real64 Timer::getElapsed() const {
+	nupic::UInt64 elapsed = prevElapsed_;
+	if (started_)
+	{
+	    const auto diff = my_clock::now() - start_time_;
+	    const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(diff);
 
-static inline nupic::UInt64 getTicksPerSec()
-{
-  return (nupic::UInt64)(1e6);
+	    elapsed += nanoseconds.count();
+	}
+
+	return static_cast<Real64>(elapsed) / TO_SECONDS;
 }
 
-#endif
 
-namespace nupic
-{
+void Timer::reset() {
+	prevElapsed_ = 0;
+	start_ = 0;
+	nstarts_ = 0;
+	started_ = false;
+}
 
-  Timer::Timer(bool startme)  
-  {
-    initTime();
-    reset();
-    if (startme)
-      start();
-  }
-  
-  
-  void Timer::start() 
-  { 
-    if (started_ == false) 
-    {
-      start_ = getCurrentTime();
-      nstarts_++;
-      started_ = true;
+UInt64 Timer::getStartCount() const { return nstarts_; }
+
+bool Timer::isStarted() const { return started_; }
+
+std::string Timer::toString() const {
+  std::stringstream ss;
+  ss << "[Elapsed: " << getElapsed() << " Starts: " << getStartCount();
+  if (isStarted())
+    ss << " (running)";
+  ss << "]";
+  return ss.str();
+}
+
+
+/**
+ * Estimate speed (CPU & load) of the current system.
+ * Tests must perform relative to this value
+ */
+float Timer::getSpeed() {
+  if (SPEED == -1) {
+
+    // This code just wastes CPU time to estimate speed.
+    Timer t(true);
+
+    Random rng(42);
+    // Make 10 million 4-byte Reals.  Each synapse take approx 30-40 bytes to
+    // represent, so this is enough memory for 1 million synapses.
+    std::vector<Real> data(10000000);
+    for( Size i = 0; i < data.size(); i++ ) {
+      data[i] = (Real)rng.getUInt32(80085);
+      auto t  = data[i];
+      data[i] = data[data.size()-i-1];
+      data[data.size()-i-1] = t;
     }
-  }
-  
-  /**
-  * Stop the stopwatch. When restarted, time will accumulate
-  */
-  
-  void Timer::stop() 
-  {  // stop the stopwatch
-    if (started_ == true) 
-    {
-      prevElapsed_ += (getCurrentTime() - start_);
-      start_ = 0;
-      started_ = false;
+    // Hurt the cache with random accesses.
+    rng.shuffle(begin(data), end(data));
+    // Test floating-point arithmatic.
+    std::vector<Real> sins;
+    for (auto d : data) {
+      sins.push_back( sin(d) / cos(d) );
     }
+    data = rng.sample<Real>(sins, 666);
+    NTA_CHECK(data.size() == 666);
+    t.stop();
+    SPEED = std::max(1.0, t.getElapsed());
+    NTA_INFO << "Timer::getSpeed() -> " << SPEED << " seconds.";
   }
-  
-  Real64 Timer::getElapsed() const
-  {   
-    nupic::UInt64 elapsed = prevElapsed_;
-    if (started_) 
-    {
-      elapsed += (getCurrentTime() - start_);
-    }   
-  
-    return (Real64)(elapsed) / (Real64)getTicksPerSec();
-  }
-  
-  void Timer::reset() 
-  {
-    prevElapsed_ = 0;
-    start_ = 0;
-    nstarts_ = 0;
-    started_ = false;
-  }
-  
-  UInt64 Timer::getStartCount() const
-  { 
-    return nstarts_; 
-  }
-  
-  bool Timer::isStarted() const
-  { 
-    return started_; 
-  }
-  
-  
-  std::string Timer::toString() const
-  {
-    std::stringstream ss;
-    ss << "[Elapsed: " << getElapsed() << " Starts: " << getStartCount();
-    if (isStarted())
-      ss << " (running)";
-    ss << "]";
-    return ss.str();
-  }
+  return (float)SPEED;
+}
 
-}  // namespace nupic
+} // namespace nupic
